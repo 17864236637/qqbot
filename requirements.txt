@@ -1,0 +1,12 @@
+# QQ 监督员机器人依赖
+websocket-client>=1.6.0
+transformers>=4.40.0
+torch>=2.1.0
+numpy>=1.24.0
+
+# ===== 可选：GGUF / 7B 模式 =====
+# 7B 走 llama.cpp 量化版（Q4_K_M，约 4.7GB），需要 llama-cpp-python。
+# 该包需从源码编译（较慢，约几分钟），编译时可限制并行度避免 OOM：
+#   CMAKE_BUILD_PARALLEL_LEVEL=2 pip install llama-cpp-python
+# 仅当你打算用 QQ_BRAIN_MODEL=7b 时才需要安装。
+# llama-cpp-python>=0.2.0
