@@ -33,3 +33,6 @@ qq_profiles.json
 
 # ===== 校准用的服务器时间缓存 =====
 qq_time_cache.json
+
+# ===== 关注名单（含群成员 QQ 号 + 昵称 + openid，属隐私数据）=====
+qq_watchlist.json
