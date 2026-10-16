@@ -23,3 +23,13 @@ _*.*
 # ===== MiniCPM5-2B（模型权重，部署时用 _setup_minicpm5.sh 下载）=====
 minicpm5_model/
 minicpm5_gguf/
+
+# ===== 崩溃转储（体积巨大，纯垃圾）=====
+core.*
+core
+
+# ===== 用户身份记忆（含群成员 openid + 昵称，属隐私数据，勿公开）=====
+qq_profiles.json
+
+# ===== 校准用的服务器时间缓存 =====
+qq_time_cache.json
