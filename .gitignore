@@ -19,3 +19,7 @@ __pycache__/
 
 # ===== 临时/调试脚本（下划线前缀）=====
 _*.*
+
+# ===== MiniCPM5-2B（模型权重，部署时用 _setup_minicpm5.sh 下载）=====
+minicpm5_model/
+minicpm5_gguf/

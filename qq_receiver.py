@@ -18,12 +18,15 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import re
 import sys
 import threading
 import time
 
 import websocket  # websocket-client
 from qq_bot import QQBot, QQBotError
+from qq_profiles import remember, get_name, extract_self_intro, apply_author
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
@@ -185,14 +188,30 @@ class Receiver:
             return  # 同一条消息被重复推送，跳过
         if mid:
             self.seen_msg_ids.add(mid)
-        content = msg.get("content", "").replace("@", "").strip()
+        # QQ 群@消息 content 形如 "<@!bot_openid>你好"；私聊/群文本也可能带 "@昵称"。
+        # 仅 replace("@","") 会残留 "<!bot_openid>" 垃圾前缀，必须把 @标签整体剥掉，
+        # 否则模型拿到的正文是脏的，回复易跑偏。
+        raw = msg.get("content") or ""
+        content = re.sub(r"<@!?[A-Za-z0-9_]+>", "", raw)   # 去掉 <@botid> / <!botid>
+        content = re.sub(r"^@\S+\s*", "", content).strip()   # 去掉开头 "@昵称 "
+        if not content:
+            content = "（对方只@了你，没说话）"
         group_id = msg.get("group_id")
         author = msg.get("author", {})
         user_openid = author.get("user_openid") or author.get("member_openid")
         msg_id = msg.get("id")
         print(f"[{self.bot_name}] 收到消息: {content!r}", flush=True)
+        # ---- 自动识别并记住用户名/昵称 ----
+        scope = "group" if group_id else "private"
+        apply_author(user_openid, author, scope)            # QQ 下发昵称兜底
+        intro = extract_self_intro(content)                 # 对话内"我是X/叫我X"
+        if intro:
+            remember(user_openid, intro, scope)
+            print(f"[{self.bot_name}] 已记住 {user_openid[:8]}… 叫 {intro}", flush=True)
+        name = get_name(user_openid)
         # ---- 群内积分：违纪检测 + 扣分 ----
         score_extra = ""
+        reasons = []
         if group_id and user_openid:
             reasons, score = self._process_score(group_id, user_openid, content, author)
             if reasons:
@@ -203,15 +222,34 @@ class Receiver:
         try:
             from qq_brain import generate
             reply = generate(
-                f"对方说：{content}",
-                system=f"你是「{self.bot_name}」——执行积分制督学的严格小管理员。每人初始10分、每月重置。规则：①每天8:00与21:00报备手机时长(标准7h，超时扣1、熬夜扣1)；②禁刷屏、禁骂人(各扣1)；③0点宵禁后发消息扣1；④不得随意惹事(扣1)；⑤写作业群里报备手机时长对比(玩手机扣1、不按时提交扣2)；⑥剩3分即开会议。违规记录、分值、惩罚账目群内存档。风格：毒舌但讲规矩、有梗、带中二、爱call名字，不爹味。最多两句话，不要解释规则，只给监督反馈或扣分播报。{score_extra}",
-                max_tokens=60, temperature=0.9,
+                f"对方说：{content}" + (f"（记住：对方叫 {name}，直接称呼其名）"
+                                       if name else "（你还不知道对方名字，不要编造，用'你'称呼即可）"),
+                system=(
+                    (f"你是「{self.bot_name}」——执行积分制督学的严格小管理员。每人初始10分、每月重置。"
+                     f"规则（仅作背景，你无权自行判定）：①每天8:00与21:00报备手机时长(标准7h，超时扣1、熬夜扣1)；"
+                     f"②禁刷屏、禁骂人(各扣1)；③0点宵禁后发消息扣1；④不得随意惹事(扣1)；"
+                     f"⑤写作业报备玩手机扣1、不按时提交扣2；⑥剩3分即开会议。"
+                     f"【铁律】扣分由系统判定，你绝不可自行决定或编造扣分。下方【本次判定】是系统给出的真实违规与扣分，"
+                     f"只有其中列出的项才能说'扣了'；若只显示当前积分，说明本次无违规——你只能正常毒舌对话，"
+                     f"绝对禁止出现'扣1''扣分''罚你'等字眼，也不得把对方的话自行定性为违纪。"
+                     f"风格：毒舌但讲规矩、有梗、带中二、爱call名字，不爹味。最多两句话。{score_extra}")
+                    if group_id else
+                    (f"你是「{self.bot_name}」——专门监督好好学习的毒舌小助手，核心算法是'监督学习'（监督的是人的学习）。"
+                     f"风格：毒舌但暖、有梗、带中二、爱call对方名字、偶尔甩热词，绝不爹味说教，最多两句话。"
+                     f"用最短的话把人从摸鱼/躺平里拽起来。不涉及扣分与记账，只催学。只给消息正文，不要引号、不要'好的'之类废话。")
+                ),
+                max_tokens=60, temperature=0.7,
             )
         except Exception as exc:
             print(f"[{self.bot_name}] 大脑失败: {exc}", flush=True)
             reply = "我在的，有什么事？"
         if not reply:
             reply = "我在的。"
+        # ---- 输出层硬过滤：本次规则没真扣分，就不准嘴上喊"扣分" ----
+        # 1.5B 小模型守不住 prompt 铁律（账簿一直是 10 分、却满嘴"扣分"），必须代码兜底。
+        really_deducted = bool(group_id and any(d < 0 for _, d in reasons))
+        if not really_deducted:
+            reply = self._strip_fake_penalty(reply)
         if group_id:
             payload = {"msg_type": 2, "markdown": {"content": reply}}
             if msg_id:
@@ -230,6 +268,33 @@ class Receiver:
                   f"{user_openid}{'' if ok else ': ' + str(err)[:80]}", flush=True)
             print(f"[{self.bot_name}] 回复内容: {reply!r}", flush=True)
             log_chat("private", user_openid, user_openid, content, reply, ok)
+
+    # 规则未真扣分、却被模型说出口的扣分字眼（口头禅拦截）
+    FAKE_PENALTY_WORDS = ("扣分", "扣了", "扣1", "扣2", "扣3",
+                          "扣你", "扣他", "扣她", "扣我", "罚你", "罚分", "扣掉")
+
+    # 整句都被扣分污染时才用的兜底文案
+    SAFE_FALLBACKS = (
+        "别摸鱼了，快去学习。",
+        "我可没说要扣分，作业写完了吗？",
+        "闲话少说，书翻开第几页了？",
+        "这话我不乱判，反正学习不能落下。",
+        "少贫两句，多背两个单词。",
+        "别跟我这儿耗着，书还没翻呢。",
+        "时间不等人，赶紧把作业安排上。",
+        "别躺了，起来把今天的计划做完。",
+    )
+
+    def _strip_fake_penalty(self, reply: str) -> str:
+        """本次规则未真扣分、模型却冒出扣分字眼 -> 剔除扣分片段，尽量保留其原话。
+        只有整句都被扣分污染（剔除后为空）才用兜底文案，避免回复千篇一律。"""
+        if not reply or not any(w in reply for w in self.FAKE_PENALTY_WORDS):
+            return reply
+        parts = [p.strip() for p in re.split(r"[，,。！？!?、；;\s]+", reply)]
+        kept = [p for p in parts if p and not any(w in p for w in self.FAKE_PENALTY_WORDS)]
+        if kept:
+            return "，".join(kept) + "。"
+        return random.choice(self.SAFE_FALLBACKS)
 
     def _process_score(self, group_id, user_openid, content, author) -> tuple:
         """群消息积分：违纪检测 + 扣分，返回 (扣分记录[(原因,分值)], 当前分数)。"""
