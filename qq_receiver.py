@@ -91,16 +91,25 @@ class Receiver:
         self.hb_interval = 30
         self.alive = True
         self.seen_msg_ids = set()  # 去重：防止沙箱/网络重推导致重复回复
+        self._last_recv = time.monotonic()  # 最近一次收到 WS 帧的时间（僵尸会话检测）
+        self._hb_ws = None                  # 当前心跳线程服务的 ws（防旧线程泄漏）
         self._cron_start()  # 启动积分定时线程（8/21点提醒、每月重置、≤3分会会议）
 
     def _token(self) -> str:
         return "QQBot " + self.bot.get_access_token()
 
     def _gateway_url(self) -> str:
+        import urllib.error
         import urllib.request
         r = urllib.request.Request(GATEWAY, headers={"Authorization": self._token()})
-        with urllib.request.urlopen(r, timeout=15) as resp:
-            return json.loads(resp.read().decode())["url"]
+        try:
+            with urllib.request.urlopen(r, timeout=15) as resp:
+                return json.loads(resp.read().decode())["url"]
+        except urllib.error.HTTPError as exc:
+            # 必须读出响应体：QQ 的真实错误码在里面（11298=IP不在白名单等）。
+            # 丢弃 body 只看到裸 "HTTP Error 401"，等于放弃诊断，历代排查都吃过这个亏。
+            body = exc.read().decode("utf-8", errors="ignore")[:200]
+            raise QQBotError(f"gateway: HTTP {exc.code} {body}", status=exc.code) from exc
 
     # ----- websocket 回调 -----
     def on_open(self, ws) -> None:
@@ -111,13 +120,14 @@ class Receiver:
             obj = json.loads(raw)
         except json.JSONDecodeError:
             return
+        self._last_recv = time.monotonic()
         op = obj.get("op")
         if op == 10:  # Hello
             self.hb_interval = max(1, obj["d"]["heartbeat_interval"] / 1000)
             self._identify(ws)
             self._heartbeat_loop(ws)
-        elif op == 11:  # Heartbeat ACK
-            pass
+        elif op == 11:  # Heartbeat ACK —— 会话存活的铁证，留痕便于诊断"连着却不回话"
+            print(f"[{self.bot_name}] 心跳 ACK op=11", flush=True)
         elif op == 1:  # 服务端要求心跳
             self._heartbeat(ws)
         elif op == 0:  # Dispatch
@@ -151,10 +161,24 @@ class Receiver:
             pass
 
     def _heartbeat_loop(self, ws) -> None:
+        self._hb_ws = ws
+
         def _loop() -> None:
-            while self.alive:
+            while self.alive and self._hb_ws is ws:
                 self._heartbeat(ws)
+                # 僵尸会话检测：超过阈值没收到任何帧（含心跳 ACK）-> 强制关闭触发外层重连。
+                # 教训：TCP 可能假活——服务端应用层已踢掉会话、底层连接却还在，
+                # 此时 recv 永久阻塞、on_close 永不触发，机器人呈"连着却不回话"的假死态，
+                # 日志一片空白，极难排查。只能靠"多久没收到帧"主动戳破。
+                if time.monotonic() - self._last_recv > max(120.0, 3 * self.hb_interval):
+                    print(f"[{self.bot_name}] 会话无响应，强制重连", flush=True)
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    return
                 time.sleep(self.hb_interval)
+
         threading.Thread(target=_loop, daemon=True).start()
 
     # ----- 业务 -----
@@ -196,7 +220,8 @@ class Receiver:
         content = re.sub(r"^@\S+\s*", "", content).strip()   # 去掉开头 "@昵称 "
         if not content:
             content = "（对方只@了你，没说话）"
-        group_id = msg.get("group_id")
+        # 官方事件体字段是 group_openid（群 OpenID），老字段名 group_id 兜底兼容
+        group_id = msg.get("group_openid") or msg.get("group_id")
         author = msg.get("author", {})
         user_openid = author.get("user_openid") or author.get("member_openid")
         msg_id = msg.get("id")
@@ -377,6 +402,7 @@ class Receiver:
 
     def run(self) -> None:
         delay = 5
+        fast_left = 0  # 剩余快速重试次数：沙箱出口 IP 每请求随机变，没抽中白名单 IP 就别干等
         while self.alive:
             try:
                 url = self._gateway_url()
@@ -386,10 +412,24 @@ class Receiver:
                     on_open=self.on_open, on_message=self.on_message,
                     on_error=self.on_error, on_close=self.on_close,
                 )
+                born = time.monotonic()
                 self.ws.run_forever()
                 delay = 5  # 正常退出（如被踢）后重置退避
+                if time.monotonic() - born < 30:
+                    # 秒级夭折 = 抽奖没中（出口 IP 不在白名单 / Identify 被 op=9 拒）。
+                    # 每次重试都是新连接、新出口 IP，短间隔连试即可提高命中率。
+                    fast_left = max(fast_left, 12)
+            except QQBotError as exc:
+                print(f"[{self.bot_name}] 连接失败: {exc}", flush=True)
+                if exc.status in (401, 403) or "白名单" in str(exc):
+                    fast_left = max(fast_left, 12)
             except Exception as exc:
                 print(f"[{self.bot_name}] 连接失败: {exc}", flush=True)
+            if fast_left > 0:
+                fast_left -= 1
+                print(f"[{self.bot_name}] 快速重试（剩 {fast_left} 次）", flush=True)
+                time.sleep(1.5)
+                continue
             # 指数退避：封顶 120s。
             # 教训：QQ 网关对短时间内反复鉴权会返回 100017（接口调用超过频率限制），
             # 把重试压得太密会把白名单刚配好的窗口也一起吃掉，所以上限调到 120s。
