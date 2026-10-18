@@ -185,6 +185,10 @@ class Receiver:
     def _handle_event(self, obj) -> None:
         t = obj.get("t")
         d = obj.get("d", {})
+        # 诊断留痕：任何 dispatch 事件的原始体都截断落盘。
+        # 教训：平台事件字段会变迁（如群标识 group_openid），不留原始体等于盲猜。
+        print(f"[{self.bot_name}] 事件 t={t} | {json.dumps(d, ensure_ascii=False)[:500]}",
+              flush=True)
         if t in ("AT_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "C2C_MESSAGE_CREATE"):
             self._reply(d)
 
@@ -293,6 +297,12 @@ class Receiver:
                   f"{user_openid}{'' if ok else ': ' + str(err)[:80]}", flush=True)
             print(f"[{self.bot_name}] 回复内容: {reply!r}", flush=True)
             log_chat("private", user_openid, user_openid, content, reply, ok)
+        else:
+            # 教训：曾经这里两不管——回复生成了却静默丢弃，日志无任何痕迹，
+            # 表现为"机器人在生成（内存暴涨）但永远不吭声"。必须留痕。
+            print(f"[{self.bot_name}] ⚠️ 回复无处可发：事件既无群标识也无用户标识。"
+                  f"author={json.dumps(author, ensure_ascii=False)[:200]} "
+                  f"msg_keys={sorted(msg.keys())}", flush=True)
 
     # 规则未真扣分、却被模型说出口的扣分字眼（口头禅拦截）
     FAKE_PENALTY_WORDS = ("扣分", "扣了", "扣1", "扣2", "扣3",
