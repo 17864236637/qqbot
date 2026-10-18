@@ -11,6 +11,10 @@
     C2C_MESSAGE_CREATE（用户单聊发消息给机器人）
     GROUP_AT_MESSAGE_CREATE（用户在群里 @机器人）
   因此私聊对话无需叠加其他位，发布后即可双向对话。
+- 群消息事件类型分两种情况（2025-10 实测踩坑）：
+    后台只开"@消息"    -> 来的是 GROUP_AT_MESSAGE_CREATE
+    后台开"接收所有消息" -> 每句话都来 GROUP_MESSAGE_CREATE（@ 机器人的也是它）
+  只写前者不写后者，全量模式下群 @ 会被当成不存在，永远不回话。
 - 沙箱模式下 WebSocket 会被服务器以 op=9 拒绝（Invalid Session），
   这是开放平台限制，发布/上架机器人后自动解除，代码侧无法绕过。
 """
@@ -93,6 +97,7 @@ class Receiver:
         self.seen_msg_ids = set()  # 去重：防止沙箱/网络重推导致重复回复
         self._last_recv = time.monotonic()  # 最近一次收到 WS 帧的时间（僵尸会话检测）
         self._hb_ws = None                  # 当前心跳线程服务的 ws（防旧线程泄漏）
+        self.bot_id = None                  # 机器人自身 ID（READY 下发），全量模式判 @ 用
         self._cron_start()  # 启动积分定时线程（8/21点提醒、每月重置、≤3分会会议）
 
     def _token(self) -> str:
@@ -186,11 +191,49 @@ class Receiver:
         t = obj.get("t")
         d = obj.get("d", {})
         # 诊断留痕：任何 dispatch 事件的原始体都截断落盘。
-        # 教训：平台事件字段会变迁（如群标识 group_openid），不留原始体等于盲猜。
-        print(f"[{self.bot_name}] 事件 t={t} | {json.dumps(d, ensure_ascii=False)[:500]}",
+        # 教训：平台事件字段会变迁（如群标识 group_openid），不留原始体等于盲猜；
+        # 且截断必须够长——曾经 [:500] 恰好把 mentions 数组切掉，
+        # 事后根本没法复盘"这条到底是不是在 @ 机器人"。
+        print(f"[{self.bot_name}] 事件 t={t} | {json.dumps(d, ensure_ascii=False)[:900]}",
               flush=True)
+        if t == "READY":
+            # 会话就绪：服务端下发机器人自身 ID，全量模式下判"是不是在@我"就靠它。
+            # 教训：曾经不存 bot_id，导致全量消息来了也只能干瞪眼。
+            self.bot_id = (d.get("user") or {}).get("id")
+            print(f"[{self.bot_name}] 会话就绪 bot_id={self.bot_id}", flush=True)
+            return
         if t in ("AT_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "C2C_MESSAGE_CREATE"):
             self._reply(d)
+        elif t == "GROUP_MESSAGE_CREATE":
+            # 根因（2025-10 实测）：后台开了"接收所有消息"（全量模式）后，
+            # 群里每句话都推这个事件类型——@ 机器人的消息也是它。
+            # 旧代码只认 GROUP_AT_MESSAGE_CREATE，于是群里的一切都被当成不存在，
+            # 表现为"@ 它永远不回"。全量模式不能来一句回一句（API 限额+骚扰），
+            # 只有被 @ 到才回。
+            if self._is_bot_mentioned(d):
+                self._reply(d)
+
+    def _is_bot_mentioned(self, d: dict) -> bool:
+        """判断一条群消息是不是在 @ 机器人。
+
+        mentions 数组的字段名历史上变过（id / user_openid / member_openid），
+        有的版本带 is_you 标记；content 里 @ 标签也有 <@id> 和 <@!id> 两种写法。
+        全部兼容——宁可多判不可漏判，漏判的代价是用户以为机器人死了。
+        """
+        if not self.bot_id:
+            return False
+        for m in d.get("mentions") or []:
+            if not isinstance(m, dict):
+                continue
+            if m.get("is_you"):
+                return True
+            if self.bot_id in (m.get("id"), m.get("user_openid"), m.get("member_openid")):
+                return True
+            user = m.get("user")
+            if isinstance(user, dict) and user.get("id") == self.bot_id:
+                return True
+        return bool(re.search(r"<@!?" + re.escape(self.bot_id) + r">",
+                              d.get("content") or ""))
 
     def _post_retry(self, path: str, payload: dict, tries: int = 8) -> tuple[bool, object]:
         """发送并针对『IP 不在白名单』重试。
