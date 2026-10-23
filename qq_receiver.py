@@ -15,6 +15,9 @@
     后台只开"@消息"    -> 来的是 GROUP_AT_MESSAGE_CREATE
     后台开"接收所有消息" -> 每句话都来 GROUP_MESSAGE_CREATE（@ 机器人的也是它）
   只写前者不写后者，全量模式下群 @ 会被当成不存在，永远不回话。
+- 督学玩法是「对赌契约」（qq_wager.py）：周一发起、周日验收、全员见证。
+  积分制已于 2026-10 停用（分数没有后果，规则沦为恐吓）——
+  数据与代码留坟于 qq_scoreboard.py / qq_rules.py + git 历史，想复活随时。
 - 沙箱模式下 WebSocket 会被服务器以 op=9 拒绝（Invalid Session），
   这是开放平台限制，发布/上架机器人后自动解除，代码侧无法绕过。
 """
@@ -36,7 +39,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 ENV_FILE = os.path.join(BASE, ".env")
 import qq_scoreboard as sb
-import qq_rules as rl
+import qq_wager as wg
 GATEWAY = "https://api.bot.qq.com/gateway/bot"
 
 # 意图位：GROUP_AND_C2C_EVENT = 1 << 25
@@ -205,6 +208,11 @@ class Receiver:
         if t in ("AT_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "C2C_MESSAGE_CREATE"):
             self._reply(d)
         elif t == "GROUP_MESSAGE_CREATE":
+            # 登记群：cron 的推送目标自生长，不依赖任何玩法是否开启
+            # （积分制停用后 sb.all_groups() 就是空的，吃过这个亏）
+            gid = d.get("group_openid") or d.get("group_id")
+            if gid:
+                wg.note_group(gid)
             # 根因（2025-10 实测）：后台开了"接收所有消息"（全量模式）后，
             # 群里每句话都推这个事件类型——@ 机器人的消息也是它。
             # 旧代码只认 GROUP_AT_MESSAGE_CREATE，于是群里的一切都被当成不存在，
@@ -281,35 +289,26 @@ class Receiver:
             remember(user_openid, intro, scope)
             print(f"[{self.bot_name}] 已记住 {user_openid[:8]}… 叫 {intro}", flush=True)
         name = get_name(user_openid)
-        # ---- 命令直达：榜单/周报是纯规则查询，绝不劳烦 7B 模型 ----
-        # 教训：这类结构化数字让模型生成，它会把 10 分说成 8 分还一脸自信。
-        # 且模型冷启动要占 6.5G 内存、等一两分钟，查个榜不值得。
-        if self._try_query(group_id, content, msg_id, user_openid):
+        # ---- 命令直达：契约/战报是纯规则，绝不劳烦 7B 模型 ----
+        # 教训：这类结构化状态让模型生成，它会把 10 分说成 8 分还一脸自信，
+        # 且模型冷启动要占 6.5G 内存、等一两分钟，记个赌约不值得。
+        if self._try_wager(group_id, content, msg_id, user_openid, name):
             return
-        # ---- 群内积分：违纪检测 + 扣分 ----
-        score_extra = ""
-        reasons = []
-        if group_id and user_openid:
-            reasons, score = self._process_score(group_id, user_openid, content, author)
-            if reasons:
-                rs = "；".join(f"{r}({d:+d})" for r, d in reasons)
-                score_extra = f"\n【本次判定】{rs}。该成员当前积分 {score} 分。"
-            else:
-                score_extra = f"\n该成员当前积分 {score} 分。"
         try:
             from qq_brain import generate
             reply = generate(
                 f"对方说：{content}" + (f"（记住：对方叫 {name}，直接称呼其名）"
                                        if name else "（你还不知道对方名字，不要编造，用'你'称呼即可）"),
                 system=(
-                    (f"你是「{self.bot_name}」——执行积分制督学的严格小管理员。每人初始10分、每月重置。"
-                     f"规则（仅作背景，你无权自行判定）：①每天8:00与21:00报备手机时长(标准7h，超时扣1、熬夜扣1)；"
-                     f"②禁刷屏、禁骂人(各扣1)；③0点宵禁后发消息扣1；④不得随意惹事(扣1)；"
-                     f"⑤写作业报备玩手机扣1、不按时提交扣2；⑥剩3分即开会议。"
-                     f"【铁律】扣分由系统判定，你绝不可自行决定或编造扣分。下方【本次判定】是系统给出的真实违规与扣分，"
-                     f"只有其中列出的项才能说'扣了'；若只显示当前积分，说明本次无违规——你只能正常毒舌对话，"
-                     f"绝对禁止出现'扣1''扣分''罚你'等字眼，也不得把对方的话自行定性为违纪。"
-                     f"风格：毒舌但讲规矩、有梗、带中二、爱call名字，不爹味。最多两句话。{score_extra}")
+                    (f"你是「{self.bot_name}」——群里同学的学习搭子，嘴毒但真希望他们好。"
+                     f"你的正职是'赌约公证人'：每周一早上9点发起本周学习赌约"
+                     f"（同学@我发'我赌+目标'即可入局，如'我赌数学作业全写完'），"
+                     f"周日晚上8点主持验收（同学回'完成'或'输了'了结赌约）。"
+                     f"【铁律】赌约名单和结果由系统记录，你只能转述系统给的名单，"
+                     f"绝不编造别人的赌约、进度或结果；群里没有'扣分''积分'这回事，"
+                     f"严禁说出任何扣分/记账相关字眼；别人问榜就说'本周战报'让系统来。"
+                     f"风格：毒舌但暖、有梗、带中二、爱call名字，不爹味。最多两句话。"
+                     f"只给消息正文，不要引号、不要'好的'之类废话。")
                     if group_id else
                     (f"你是「{self.bot_name}」——专门监督好好学习的毒舌小助手，核心算法是'监督学习'（监督的是人的学习）。"
                      f"风格：毒舌但暖、有梗、带中二、爱call对方名字、偶尔甩热词，绝不爹味说教，最多两句话。"
@@ -322,11 +321,6 @@ class Receiver:
             reply = "我在的，有什么事？"
         if not reply:
             reply = "我在的。"
-        # ---- 输出层硬过滤：本次规则没真扣分，就不准嘴上喊"扣分" ----
-        # 1.5B 小模型守不住 prompt 铁律（账簿一直是 10 分、却满嘴"扣分"），必须代码兜底。
-        really_deducted = bool(group_id and any(d < 0 for _, d in reasons))
-        if not really_deducted:
-            reply = self._strip_fake_penalty(reply)
         if group_id:
             payload = {"msg_type": 2, "markdown": {"content": reply}}
             if msg_id:
@@ -352,31 +346,46 @@ class Receiver:
                   f"author={json.dumps(author, ensure_ascii=False)[:200]} "
                   f"msg_keys={sorted(msg.keys())}", flush=True)
 
-    # ---- 榜单/周报命令（纯规则，不过模型）----
-    BOARD_KEYS = ("排行榜", "积分榜", "榜单", "看看榜", "查分", "查榜单")
-    WEEK_KEYS = ("周报", "本周报告", "这周总结", "本周总结")
+    # ---- 赌约命令（纯规则，不过模型）----
+    # 验收词刻意用全等匹配而非子串：日常聊天里"完成了""没做完"遍地都是，
+    # 用子串会把闲聊全判成认账，赌约账本就废了。
+    DONE_WORDS = ("完成", "我完成了", "做到了", "我做到了", "兑现", "已兑现")
+    LOST_WORDS = ("输了", "我输了", "赖账", "没做到", "没完成", "翻车", "翻车了")
 
-    def _try_query(self, group_id, content: str, msg_id, user_openid) -> bool:
-        """榜单/周报命令识别。命中则被动回复并返回 True。
-
-        只在群聊生效（私聊没有群上下文）。命令消息不进违纪检测，
-        否则"看看排行榜"会被记进写作业状态机之类的，纯属误伤。
-        """
-        if not group_id or not content:
+    def _try_wager(self, group_id, content: str, msg_id, user_openid, name) -> bool:
+        """契约命令：我赌+目标 / 完成 / 输了 / 战报。命中则被动回复，返回 True。"""
+        if not group_id or not content or not user_openid:
             return False
-        if any(k in content for k in self.BOARD_KEYS):
-            text = self._board_text(group_id)
+        stripped = content.strip()
+        # 入局：我赌 xxx / 赌 xxx
+        m = re.match(r"^(?:我)?赌\s*(.+)$", stripped)
+        if m:
+            text = wg.join_bet(group_id, user_openid, name or "", m.group(1))
             ok, err = self._send_text(group_id, text, msg_id)
-            print(f"[{self.bot_name}] 榜单查询 {'已回' if ok else '失败: ' + str(err)[:80]}",
+            print(f"[{self.bot_name}] 契约入局 {'已回' if ok else '失败: ' + str(err)[:80]}",
                   flush=True)
-            log_chat("group", group_id, user_openid or "", content, text, ok)
+            log_chat("group", group_id, user_openid, content, text, ok)
             return True
-        if any(k in content for k in self.WEEK_KEYS):
-            text = self._weekly_text(group_id)
+        if stripped in self.DONE_WORDS:
+            text = wg.settle(group_id, user_openid, done=True)
             ok, err = self._send_text(group_id, text, msg_id)
-            print(f"[{self.bot_name}] 周报查询 {'已回' if ok else '失败: ' + str(err)[:80]}",
+            print(f"[{self.bot_name}] 契约兑现 {'已回' if ok else '失败: ' + str(err)[:80]}",
                   flush=True)
-            log_chat("group", group_id, user_openid or "", content, text, ok)
+            log_chat("group", group_id, user_openid, content, text, ok)
+            return True
+        if stripped in self.LOST_WORDS:
+            text = wg.settle(group_id, user_openid, done=False)
+            ok, err = self._send_text(group_id, text, msg_id)
+            print(f"[{self.bot_name}] 契约认栽 {'已回' if ok else '失败: ' + str(err)[:80]}",
+                  flush=True)
+            log_chat("group", group_id, user_openid, content, text, ok)
+            return True
+        if any(k in content for k in ("战报", "赌约", "契约")):
+            text = self._wager_report_text(group_id)
+            ok, err = self._send_text(group_id, text, msg_id)
+            print(f"[{self.bot_name}] 战报查询 {'已回' if ok else '失败: ' + str(err)[:80]}",
+                  flush=True)
+            log_chat("group", group_id, user_openid, content, text, ok)
             return True
         return False
 
@@ -391,150 +400,92 @@ class Receiver:
             payload["msg_id"] = msg_id  # 被动回复，绕开主动消息限额
         return self._post_retry(f"/v2/groups/{group_id}/messages", payload)
 
-    def _board_text(self, group_id: str) -> str:
-        """当前积分榜文本。"""
-        snap = sb.snapshot(group_id) or []
-        if not snap:
-            return "本群还没有积分数据——先让人在群里说句话建个档。"
-        medals = ("🥇", "🥈", "🥉")
-        lines = ["📊 当前积分榜（每月1号重置，每人初始10分）"]
-        for i, m in enumerate(snap):
-            icon = medals[i] if i < 3 else f"{i + 1}."
-            lines.append(f"{icon} {m['name']} —— {m['score']} 分")
-        lines.append("扣分由系统按规则判定，有异议找管理员对账。")
+    def _wager_report_text(self, group_id: str) -> str:
+        """本周赌约战报。"""
+        bs = wg.bets(group_id)
+        if not bs:
+            return ("本周还没人入局。参与方式：@我 + 「我赌+你的目标」\n"
+                    "例：我赌数学作业全写完。周日晚8点验收，全员见证。")
+        state = {"pending": "⏳待验收", "done": "✅兑现",
+                 "lost": "❌认栽", "overdue": "⚠️逾期"}
+        lines = [f"⚔️ 本周赌约战报（{wg.week_key()}）"]
+        for b in bs:
+            lines.append(f"· {b['name']}：{b['goal']} —— {state.get(b['status'], b['status'])}")
+        pend = [b for b in bs if b["status"] == "pending"]
+        if pend:
+            names = "、".join(b["name"] for b in pend)
+            lines.append(f"\n待验收：{names}。做到了回「完成」，赖账回「输了」。")
+        else:
+            lines.append("\n全员已认账，本周闭幕。下周一再战。")
         return "\n".join(lines)
 
-    def _weekly_text(self, group_id: str) -> str:
-        """近 7 天周报文本：积分 + 本周净变化 + 违规明细 + 本周之星。"""
-        rep = sb.weekly_report(group_id)
-        if not rep or not rep["members"]:
-            return "本群还没有积分数据，周报无从谈起。"
-        members = rep["members"]
-        medals = ("🥇", "🥈", "🥉")
-        lines = [f"📅 督学周报（近7天，截至{time.strftime('%m-%d %H:%M')}）", "", "🏆 当前积分："]
-        for i, m in enumerate(members):
-            icon = medals[i] if i < 3 else f"{i + 1}."
-            delta = f"{m['week_delta']:+d}" if m["week_delta"] else "±0"
-            lines.append(f"{icon} {m['name']} —— {m['score']} 分（本周{delta}）")
-        dirty = [m for m in members if m["items"]]
-        lines.append("")
-        if dirty:
-            lines.append("📉 本周账目：")
-            for m in dirty:
-                items = "、".join(f"{r}({d:+d})" for r, d in m["items"])
-                lines.append(f"· {m['name']}：{items}")
-        else:
-            lines.append("📉 本周全员零违规。离谱，但表扬。")
-        clean = [m["name"] for m in members if m["clean"]]
-        if clean:
-            lines.append("")
-            lines.append(f"⭐ 本周之星：{'、'.join(clean)}（一周没被扣过分）")
-        lines.append("")
-        lines.append("每月1号重置积分，下周重开一局。")
+    def _wager_open_text(self, group_id: str) -> str:
+        """周一早上的契约发起文案；带上周逾期未认的点名。"""
+        lines = ["📢 本周学习契约开启！",
+                 "参与方式：@我 发送「我赌+你的目标」",
+                 "例：我赌数学作业全写完",
+                 "规则：周日晚8点验收，做到了回「完成」，赖账回「输了」，全员见证。",
+                 "输了的惩罚群规自定（红包/头像/叫爸爸都行），机器人只公证，不动手。"]
+        od = wg.overdue_last_week(group_id)
+        if od:
+            names = "、".join(b["name"] for b in od)
+            lines.append(f"⚠️ 上周逾期未认账：{names}。账不会消失，只会挂在那儿。")
         return "\n".join(lines)
 
-    # 规则未真扣分、却被模型说出口的扣分字眼（口头禅拦截）
-    FAKE_PENALTY_WORDS = ("扣分", "扣了", "扣1", "扣2", "扣3",
-                          "扣你", "扣他", "扣她", "扣我", "罚你", "罚分", "扣掉")
-
-    # 整句都被扣分污染时才用的兜底文案
-    SAFE_FALLBACKS = (
-        "别摸鱼了，快去学习。",
-        "我可没说要扣分，作业写完了吗？",
-        "闲话少说，书翻开第几页了？",
-        "这话我不乱判，反正学习不能落下。",
-        "少贫两句，多背两个单词。",
-        "别跟我这儿耗着，书还没翻呢。",
-        "时间不等人，赶紧把作业安排上。",
-        "别躺了，起来把今天的计划做完。",
-    )
-
-    def _strip_fake_penalty(self, reply: str) -> str:
-        """本次规则未真扣分、模型却冒出扣分字眼 -> 剔除扣分片段，尽量保留其原话。
-        只有整句都被扣分污染（剔除后为空）才用兜底文案，避免回复千篇一律。"""
-        if not reply or not any(w in reply for w in self.FAKE_PENALTY_WORDS):
-            return reply
-        parts = [p.strip() for p in re.split(r"[，,。！？!?、；;\s]+", reply)]
-        kept = [p for p in parts if p and not any(w in p for w in self.FAKE_PENALTY_WORDS)]
-        if kept:
-            return "，".join(kept) + "。"
-        return random.choice(self.SAFE_FALLBACKS)
-
-    def _process_score(self, group_id, user_openid, content, author) -> tuple:
-        """群消息积分：违纪检测 + 扣分，返回 (扣分记录[(原因,分值)], 当前分数)。"""
-        name = author.get("nickname") or author.get("user_name") or user_openid
-        sb.ensure_member(group_id, user_openid, name)
-        reasons = []
-        # 写作业报备状态机
-        if rl.is_hw_start(content):
-            if rl.start_homework(group_id, user_openid):
-                reasons.append(("报备开始写作业", 0))
-        elif rl.is_hw_end(content):
-            play, overdue, dur = rl.end_homework(group_id, user_openid)
-            if play:
-                reasons.append(("写作业时玩手机", -1))
-            if overdue:
-                reasons.append(("不按时提交作业", -2))
-            if not play and not overdue:
-                reasons.append(("按时完成作业", 0))
+    def _wager_check_text(self, group_id: str) -> str:
+        """周日晚上验收文案。"""
+        bs = wg.bets(group_id)
+        if not bs:
+            return ("⏰ 本周无人入局，契约空转。\n"
+                    "想玩的随时@我发「我赌+目标」，下周一开始计。")
+        mark = {"done": "✅", "lost": "❌", "overdue": "⚠️", "pending": "⏳"}
+        lines = ["⏰ 本周赌约验收开始！", ""]
+        for b in bs:
+            lines.append(f"{mark.get(b['status'], '·')} {b['name']}：{b['goal']}")
+        pend = [b for b in bs if b["status"] == "pending"]
+        if pend:
+            names = "、".join(b["name"] for b in pend)
+            lines.append(f"\n还没认账的：{names}。做到了回「完成」，赖账回「输了」，全员见证。")
         else:
-            rl.note_homework_msg(group_id, user_openid)
-        # 违纪检测（所有消息都查）
-        if rl.check_spam(group_id, user_openid):
-            reasons.append(("刷屏", -1))
-        if rl.check_badword(content):
-            reasons.append(("骂人", -1))
-        if rl.check_curfew():
-            reasons.append(("宵禁发消息", -1))
-        if rl.check_provoke(content):
-            reasons.append(("惹事", -1))
-        # 执行扣分
-        score = sb.get_score(group_id, user_openid)
-        for reason, delta in reasons:
-            if delta != 0:
-                score, _ = sb.deduct(group_id, user_openid, delta, reason, name)
-        return reasons, score
+            lines.append("\n全员已认账，本周闭幕。下周一再战。")
+        return "\n".join(lines)
 
     def _cron_start(self) -> None:
-        """启动积分定时线程：8/21 点报备提醒、每月重置、≤3 分召会议。不加载模型。"""
+        """启动契约定时线程：周一9点发起赌约、周日20点验收、8/21点催学。不加载模型。"""
 
         def loop() -> None:
-            print(f"[{self.bot_name}] 积分定时线程已启动", flush=True)
-            last_month = time.strftime("%Y-%m")
+            print(f"[{self.bot_name}] 契约定时线程已启动", flush=True)
             last_hour = -1
-            # 启动时静默：不补发本周期周报，只等下一个周日 20 点
-            last_week = (time.localtime().tm_year, int(time.strftime("%W")))
+            # 启动时静默：本周已过的周期动作不补发，只等下一个触发点
+            last_fired: set[str] = set()
             while self.alive:
                 try:
                     now = time.localtime()
-                    m = time.strftime("%Y-%m")
-                    if m != last_month:
-                        sb.monthly_reset_if_needed(m)
-                        last_month = m
-                    # 每周日 20:00 周报（tm_wday: 周一=0 … 周日=6）
-                    if now.tm_wday == 6 and now.tm_hour == 20:
-                        week_key = (now.tm_year, int(time.strftime("%W")))
-                        if last_week != week_key:
-                            last_week = week_key
-                            for gid in sb.all_groups():
-                                self._cron_push(gid, self._weekly_text(gid))
+                    # 周一 9:00 发起本周赌约（tm_wday: 周一=0 … 周日=6）
+                    if now.tm_wday == 0 and now.tm_hour == 9 and "open" not in last_fired:
+                        last_fired.add("open")
+                        for gid in wg.known_groups():
+                            self._cron_push(gid, self._wager_open_text(gid))
+                    # 周日 20:00 主持验收
+                    if now.tm_wday == 6 and now.tm_hour == 20 and "check" not in last_fired:
+                        last_fired.add("check")
+                        for gid in wg.known_groups():
+                            self._cron_push(gid, self._wager_check_text(gid))
+                    # 周一 0 点跨周，放行下一轮触发
+                    if now.tm_wday == 0 and now.tm_hour == 0:
+                        last_fired.discard("open")
+                        last_fired.discard("check")
                     if now.tm_hour != last_hour:
                         last_hour = now.tm_hour
+                        # 8/21 点催学：只留节奏，不带任何积分色彩
                         if now.tm_hour in (8, 21):
-                            for gid in sb.all_groups():
-                                self._cron_push(
-                                    gid,
-                                    "【积分督学】报备手机时长！标准7h，超时扣1分、熬夜扣1分。"
-                                    "格式示例：我手机用了Xh",
-                                )
-                        for gid in sb.all_groups():
-                            snap = sb.snapshot(gid) or []
-                            low = [x["name"] for x in snap if x["score"] <= 3]
-                            if low:
-                                self._cron_push(
-                                    gid,
-                                    f"【会议通知】以下成员分数≤3，召开复盘会议：{', '.join(low)}",
-                                )
+                            text = ("【催学】新的一天。今天打算学点啥？"
+                                    "@我 发「我赌+目标」即可入局本周赌约。"
+                                    if now.tm_hour == 8 else
+                                    "【复盘】今晚复盘：今天的赌约推进得怎么样了？"
+                                    "没动静的自己心里有数。")
+                            for gid in wg.known_groups():
+                                self._cron_push(gid, text)
                 except Exception as exc:  # noqa: BLE001
                     print(f"[{self.bot_name}] cron 异常: {exc}", flush=True)
                 time.sleep(30)
