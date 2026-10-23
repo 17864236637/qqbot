@@ -148,3 +148,37 @@ def all_groups() -> list:
         return [gid for gid, g in d["groups"].items() if g.get("members")]
 
     return _with_lock(op)
+
+
+def weekly_report(group: str, days: int = 7) -> dict | None:
+    """聚合近 days 天数据用于周报。无此群返回 None。
+
+    返回 {members: [{name, score, week_delta, items, clean}]}：
+    - week_delta: 本周净增减分
+    - items: [(原因, 分值), ...] 只含分值非 0 的真实账目
+      （"每月重置""报备写作业"等 0 分记录是状态噪音，剔除）
+    - clean: 本周无任何扣分
+    members 按当前分数降序。
+    """
+    cutoff = time.time() - days * 86400
+    # ts 格式 "%Y-%m-%d %H:%M" 定长，字符串字典序即时间序，可直接比较
+    cutoff_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(cutoff))
+
+    def op(d):
+        g = d["groups"].get(group)
+        if not g:
+            return None
+        members = []
+        for m in g["members"].values():
+            week = [v for v in m["violations"] if v["ts"] >= cutoff_str]
+            members.append({
+                "name": m["name"],
+                "score": m["score"],
+                "week_delta": sum(v["delta"] for v in week),
+                "items": [(v["reason"], v["delta"]) for v in week if v["delta"] != 0],
+                "clean": not any(v["delta"] < 0 for v in week),
+            })
+        members.sort(key=lambda x: x["score"], reverse=True)
+        return {"members": members}
+
+    return _with_lock(op)

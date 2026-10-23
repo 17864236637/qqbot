@@ -281,6 +281,11 @@ class Receiver:
             remember(user_openid, intro, scope)
             print(f"[{self.bot_name}] 已记住 {user_openid[:8]}… 叫 {intro}", flush=True)
         name = get_name(user_openid)
+        # ---- 命令直达：榜单/周报是纯规则查询，绝不劳烦 7B 模型 ----
+        # 教训：这类结构化数字让模型生成，它会把 10 分说成 8 分还一脸自信。
+        # 且模型冷启动要占 6.5G 内存、等一两分钟，查个榜不值得。
+        if self._try_query(group_id, content, msg_id, user_openid):
+            return
         # ---- 群内积分：违纪检测 + 扣分 ----
         score_extra = ""
         reasons = []
@@ -346,6 +351,87 @@ class Receiver:
             print(f"[{self.bot_name}] ⚠️ 回复无处可发：事件既无群标识也无用户标识。"
                   f"author={json.dumps(author, ensure_ascii=False)[:200]} "
                   f"msg_keys={sorted(msg.keys())}", flush=True)
+
+    # ---- 榜单/周报命令（纯规则，不过模型）----
+    BOARD_KEYS = ("排行榜", "积分榜", "榜单", "看看榜", "查分", "查榜单")
+    WEEK_KEYS = ("周报", "本周报告", "这周总结", "本周总结")
+
+    def _try_query(self, group_id, content: str, msg_id, user_openid) -> bool:
+        """榜单/周报命令识别。命中则被动回复并返回 True。
+
+        只在群聊生效（私聊没有群上下文）。命令消息不进违纪检测，
+        否则"看看排行榜"会被记进写作业状态机之类的，纯属误伤。
+        """
+        if not group_id or not content:
+            return False
+        if any(k in content for k in self.BOARD_KEYS):
+            text = self._board_text(group_id)
+            ok, err = self._send_text(group_id, text, msg_id)
+            print(f"[{self.bot_name}] 榜单查询 {'已回' if ok else '失败: ' + str(err)[:80]}",
+                  flush=True)
+            log_chat("group", group_id, user_openid or "", content, text, ok)
+            return True
+        if any(k in content for k in self.WEEK_KEYS):
+            text = self._weekly_text(group_id)
+            ok, err = self._send_text(group_id, text, msg_id)
+            print(f"[{self.bot_name}] 周报查询 {'已回' if ok else '失败: ' + str(err)[:80]}",
+                  flush=True)
+            log_chat("group", group_id, user_openid or "", content, text, ok)
+            return True
+        return False
+
+    def _send_text(self, group_id: str, text: str, msg_id) -> tuple[bool, object]:
+        """群内被动回复纯文本。
+
+        刻意用 msg_type 0 而不是 2(markdown)：markdown 消息需要机器人有
+        "原生 markdown"权限，没开的话发送直接失败——榜单这种纯文本没必要赌。
+        """
+        payload = {"msg_type": 0, "content": text}
+        if msg_id:
+            payload["msg_id"] = msg_id  # 被动回复，绕开主动消息限额
+        return self._post_retry(f"/v2/groups/{group_id}/messages", payload)
+
+    def _board_text(self, group_id: str) -> str:
+        """当前积分榜文本。"""
+        snap = sb.snapshot(group_id) or []
+        if not snap:
+            return "本群还没有积分数据——先让人在群里说句话建个档。"
+        medals = ("🥇", "🥈", "🥉")
+        lines = ["📊 当前积分榜（每月1号重置，每人初始10分）"]
+        for i, m in enumerate(snap):
+            icon = medals[i] if i < 3 else f"{i + 1}."
+            lines.append(f"{icon} {m['name']} —— {m['score']} 分")
+        lines.append("扣分由系统按规则判定，有异议找管理员对账。")
+        return "\n".join(lines)
+
+    def _weekly_text(self, group_id: str) -> str:
+        """近 7 天周报文本：积分 + 本周净变化 + 违规明细 + 本周之星。"""
+        rep = sb.weekly_report(group_id)
+        if not rep or not rep["members"]:
+            return "本群还没有积分数据，周报无从谈起。"
+        members = rep["members"]
+        medals = ("🥇", "🥈", "🥉")
+        lines = [f"📅 督学周报（近7天，截至{time.strftime('%m-%d %H:%M')}）", "", "🏆 当前积分："]
+        for i, m in enumerate(members):
+            icon = medals[i] if i < 3 else f"{i + 1}."
+            delta = f"{m['week_delta']:+d}" if m["week_delta"] else "±0"
+            lines.append(f"{icon} {m['name']} —— {m['score']} 分（本周{delta}）")
+        dirty = [m for m in members if m["items"]]
+        lines.append("")
+        if dirty:
+            lines.append("📉 本周账目：")
+            for m in dirty:
+                items = "、".join(f"{r}({d:+d})" for r, d in m["items"])
+                lines.append(f"· {m['name']}：{items}")
+        else:
+            lines.append("📉 本周全员零违规。离谱，但表扬。")
+        clean = [m["name"] for m in members if m["clean"]]
+        if clean:
+            lines.append("")
+            lines.append(f"⭐ 本周之星：{'、'.join(clean)}（一周没被扣过分）")
+        lines.append("")
+        lines.append("每月1号重置积分，下周重开一局。")
+        return "\n".join(lines)
 
     # 规则未真扣分、却被模型说出口的扣分字眼（口头禅拦截）
     FAKE_PENALTY_WORDS = ("扣分", "扣了", "扣1", "扣2", "扣3",
@@ -416,6 +502,8 @@ class Receiver:
             print(f"[{self.bot_name}] 积分定时线程已启动", flush=True)
             last_month = time.strftime("%Y-%m")
             last_hour = -1
+            # 启动时静默：不补发本周期周报，只等下一个周日 20 点
+            last_week = (time.localtime().tm_year, int(time.strftime("%W")))
             while self.alive:
                 try:
                     now = time.localtime()
@@ -423,6 +511,13 @@ class Receiver:
                     if m != last_month:
                         sb.monthly_reset_if_needed(m)
                         last_month = m
+                    # 每周日 20:00 周报（tm_wday: 周一=0 … 周日=6）
+                    if now.tm_wday == 6 and now.tm_hour == 20:
+                        week_key = (now.tm_year, int(time.strftime("%W")))
+                        if last_week != week_key:
+                            last_week = week_key
+                            for gid in sb.all_groups():
+                                self._cron_push(gid, self._weekly_text(gid))
                     if now.tm_hour != last_hour:
                         last_hour = now.tm_hour
                         if now.tm_hour in (8, 21):
