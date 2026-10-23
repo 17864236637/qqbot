@@ -15,9 +15,9 @@
     后台只开"@消息"    -> 来的是 GROUP_AT_MESSAGE_CREATE
     后台开"接收所有消息" -> 每句话都来 GROUP_MESSAGE_CREATE（@ 机器人的也是它）
   只写前者不写后者，全量模式下群 @ 会被当成不存在，永远不回话。
-- 督学玩法是「对赌契约」（qq_wager.py）：周一发起、周日验收、全员见证。
-  积分制已于 2026-10 停用（分数没有后果，规则沦为恐吓）——
-  数据与代码留坟于 qq_scoreboard.py / qq_rules.py + git 历史，想复活随时。
+- 督学玩法（积分制/对赌契约）均已退役：账本类玩法在这个小群被证实没有意义，
+  机器人回到最初形态——能听能回的毒舌聊天学伴。代码留坟于
+  qq_scoreboard.py / qq_rules.py / qq_wager.py + git 历史，想复活随时。
 - 沙箱模式下 WebSocket 会被服务器以 op=9 拒绝（Invalid Session），
   这是开放平台限制，发布/上架机器人后自动解除，代码侧无法绕过。
 """
@@ -39,7 +39,6 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 ENV_FILE = os.path.join(BASE, ".env")
 import qq_scoreboard as sb
-import qq_wager as wg
 GATEWAY = "https://api.bot.qq.com/gateway/bot"
 
 # 意图位：GROUP_AND_C2C_EVENT = 1 << 25
@@ -101,7 +100,6 @@ class Receiver:
         self._last_recv = time.monotonic()  # 最近一次收到 WS 帧的时间（僵尸会话检测）
         self._hb_ws = None                  # 当前心跳线程服务的 ws（防旧线程泄漏）
         self.bot_id = None                  # 机器人自身 ID（READY 下发），全量模式判 @ 用
-        self._cron_start()  # 启动积分定时线程（8/21点提醒、每月重置、≤3分会会议）
 
     def _token(self) -> str:
         return "QQBot " + self.bot.get_access_token()
@@ -208,11 +206,6 @@ class Receiver:
         if t in ("AT_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE", "C2C_MESSAGE_CREATE"):
             self._reply(d)
         elif t == "GROUP_MESSAGE_CREATE":
-            # 登记群：cron 的推送目标自生长，不依赖任何玩法是否开启
-            # （积分制停用后 sb.all_groups() 就是空的，吃过这个亏）
-            gid = d.get("group_openid") or d.get("group_id")
-            if gid:
-                wg.note_group(gid)
             # 根因（2025-10 实测）：后台开了"接收所有消息"（全量模式）后，
             # 群里每句话都推这个事件类型——@ 机器人的消息也是它。
             # 旧代码只认 GROUP_AT_MESSAGE_CREATE，于是群里的一切都被当成不存在，
@@ -289,11 +282,6 @@ class Receiver:
             remember(user_openid, intro, scope)
             print(f"[{self.bot_name}] 已记住 {user_openid[:8]}… 叫 {intro}", flush=True)
         name = get_name(user_openid)
-        # ---- 命令直达：契约/战报是纯规则，绝不劳烦 7B 模型 ----
-        # 教训：这类结构化状态让模型生成，它会把 10 分说成 8 分还一脸自信，
-        # 且模型冷启动要占 6.5G 内存、等一两分钟，记个赌约不值得。
-        if self._try_wager(group_id, content, msg_id, user_openid, name):
-            return
         try:
             from qq_brain import generate
             reply = generate(
@@ -301,12 +289,6 @@ class Receiver:
                                        if name else "（你还不知道对方名字，不要编造，用'你'称呼即可）"),
                 system=(
                     (f"你是「{self.bot_name}」——群里同学的学习搭子，嘴毒但真希望他们好。"
-                     f"你的正职是'赌约公证人'：每周一早上9点发起本周学习赌约"
-                     f"（同学@我发'我赌+目标'即可入局，如'我赌数学作业全写完'），"
-                     f"周日晚上8点主持验收（同学回'完成'或'输了'了结赌约）。"
-                     f"【铁律】赌约名单和结果由系统记录，你只能转述系统给的名单，"
-                     f"绝不编造别人的赌约、进度或结果；群里没有'扣分''积分'这回事，"
-                     f"严禁说出任何扣分/记账相关字眼；别人问榜就说'本周战报'让系统来。"
                      f"风格：毒舌但暖、有梗、带中二、爱call名字，不爹味。最多两句话。"
                      f"只给消息正文，不要引号、不要'好的'之类废话。")
                     if group_id else
@@ -345,159 +327,6 @@ class Receiver:
             print(f"[{self.bot_name}] ⚠️ 回复无处可发：事件既无群标识也无用户标识。"
                   f"author={json.dumps(author, ensure_ascii=False)[:200]} "
                   f"msg_keys={sorted(msg.keys())}", flush=True)
-
-    # ---- 赌约命令（纯规则，不过模型）----
-    # 验收词刻意用全等匹配而非子串：日常聊天里"完成了""没做完"遍地都是，
-    # 用子串会把闲聊全判成认账，赌约账本就废了。
-    DONE_WORDS = ("完成", "我完成了", "做到了", "我做到了", "兑现", "已兑现")
-    LOST_WORDS = ("输了", "我输了", "赖账", "没做到", "没完成", "翻车", "翻车了")
-
-    def _try_wager(self, group_id, content: str, msg_id, user_openid, name) -> bool:
-        """契约命令：我赌+目标 / 完成 / 输了 / 战报。命中则被动回复，返回 True。"""
-        if not group_id or not content or not user_openid:
-            return False
-        stripped = content.strip()
-        # 入局：我赌 xxx / 赌 xxx
-        m = re.match(r"^(?:我)?赌\s*(.+)$", stripped)
-        if m:
-            text = wg.join_bet(group_id, user_openid, name or "", m.group(1))
-            ok, err = self._send_text(group_id, text, msg_id)
-            print(f"[{self.bot_name}] 契约入局 {'已回' if ok else '失败: ' + str(err)[:80]}",
-                  flush=True)
-            log_chat("group", group_id, user_openid, content, text, ok)
-            return True
-        if stripped in self.DONE_WORDS:
-            text = wg.settle(group_id, user_openid, done=True)
-            ok, err = self._send_text(group_id, text, msg_id)
-            print(f"[{self.bot_name}] 契约兑现 {'已回' if ok else '失败: ' + str(err)[:80]}",
-                  flush=True)
-            log_chat("group", group_id, user_openid, content, text, ok)
-            return True
-        if stripped in self.LOST_WORDS:
-            text = wg.settle(group_id, user_openid, done=False)
-            ok, err = self._send_text(group_id, text, msg_id)
-            print(f"[{self.bot_name}] 契约认栽 {'已回' if ok else '失败: ' + str(err)[:80]}",
-                  flush=True)
-            log_chat("group", group_id, user_openid, content, text, ok)
-            return True
-        if any(k in content for k in ("战报", "赌约", "契约")):
-            text = self._wager_report_text(group_id)
-            ok, err = self._send_text(group_id, text, msg_id)
-            print(f"[{self.bot_name}] 战报查询 {'已回' if ok else '失败: ' + str(err)[:80]}",
-                  flush=True)
-            log_chat("group", group_id, user_openid, content, text, ok)
-            return True
-        return False
-
-    def _send_text(self, group_id: str, text: str, msg_id) -> tuple[bool, object]:
-        """群内被动回复纯文本。
-
-        刻意用 msg_type 0 而不是 2(markdown)：markdown 消息需要机器人有
-        "原生 markdown"权限，没开的话发送直接失败——榜单这种纯文本没必要赌。
-        """
-        payload = {"msg_type": 0, "content": text}
-        if msg_id:
-            payload["msg_id"] = msg_id  # 被动回复，绕开主动消息限额
-        return self._post_retry(f"/v2/groups/{group_id}/messages", payload)
-
-    def _wager_report_text(self, group_id: str) -> str:
-        """本周赌约战报。"""
-        bs = wg.bets(group_id)
-        if not bs:
-            return ("本周还没人入局。参与方式：@我 + 「我赌+你的目标」\n"
-                    "例：我赌数学作业全写完。周日晚8点验收，全员见证。")
-        state = {"pending": "⏳待验收", "done": "✅兑现",
-                 "lost": "❌认栽", "overdue": "⚠️逾期"}
-        lines = [f"⚔️ 本周赌约战报（{wg.week_key()}）"]
-        for b in bs:
-            lines.append(f"· {b['name']}：{b['goal']} —— {state.get(b['status'], b['status'])}")
-        pend = [b for b in bs if b["status"] == "pending"]
-        if pend:
-            names = "、".join(b["name"] for b in pend)
-            lines.append(f"\n待验收：{names}。做到了回「完成」，赖账回「输了」。")
-        else:
-            lines.append("\n全员已认账，本周闭幕。下周一再战。")
-        return "\n".join(lines)
-
-    def _wager_open_text(self, group_id: str) -> str:
-        """周一早上的契约发起文案；带上周逾期未认的点名。"""
-        lines = ["📢 本周学习契约开启！",
-                 "参与方式：@我 发送「我赌+你的目标」",
-                 "例：我赌数学作业全写完",
-                 "规则：周日晚8点验收，做到了回「完成」，赖账回「输了」，全员见证。",
-                 "输了的惩罚群规自定（红包/头像/叫爸爸都行），机器人只公证，不动手。"]
-        od = wg.overdue_last_week(group_id)
-        if od:
-            names = "、".join(b["name"] for b in od)
-            lines.append(f"⚠️ 上周逾期未认账：{names}。账不会消失，只会挂在那儿。")
-        return "\n".join(lines)
-
-    def _wager_check_text(self, group_id: str) -> str:
-        """周日晚上验收文案。"""
-        bs = wg.bets(group_id)
-        if not bs:
-            return ("⏰ 本周无人入局，契约空转。\n"
-                    "想玩的随时@我发「我赌+目标」，下周一开始计。")
-        mark = {"done": "✅", "lost": "❌", "overdue": "⚠️", "pending": "⏳"}
-        lines = ["⏰ 本周赌约验收开始！", ""]
-        for b in bs:
-            lines.append(f"{mark.get(b['status'], '·')} {b['name']}：{b['goal']}")
-        pend = [b for b in bs if b["status"] == "pending"]
-        if pend:
-            names = "、".join(b["name"] for b in pend)
-            lines.append(f"\n还没认账的：{names}。做到了回「完成」，赖账回「输了」，全员见证。")
-        else:
-            lines.append("\n全员已认账，本周闭幕。下周一再战。")
-        return "\n".join(lines)
-
-    def _cron_start(self) -> None:
-        """启动契约定时线程：周一9点发起赌约、周日20点验收、8/21点催学。不加载模型。"""
-
-        def loop() -> None:
-            print(f"[{self.bot_name}] 契约定时线程已启动", flush=True)
-            last_hour = -1
-            # 启动时静默：本周已过的周期动作不补发，只等下一个触发点
-            last_fired: set[str] = set()
-            while self.alive:
-                try:
-                    now = time.localtime()
-                    # 周一 9:00 发起本周赌约（tm_wday: 周一=0 … 周日=6）
-                    if now.tm_wday == 0 and now.tm_hour == 9 and "open" not in last_fired:
-                        last_fired.add("open")
-                        for gid in wg.known_groups():
-                            self._cron_push(gid, self._wager_open_text(gid))
-                    # 周日 20:00 主持验收
-                    if now.tm_wday == 6 and now.tm_hour == 20 and "check" not in last_fired:
-                        last_fired.add("check")
-                        for gid in wg.known_groups():
-                            self._cron_push(gid, self._wager_check_text(gid))
-                    # 周一 0 点跨周，放行下一轮触发
-                    if now.tm_wday == 0 and now.tm_hour == 0:
-                        last_fired.discard("open")
-                        last_fired.discard("check")
-                    if now.tm_hour != last_hour:
-                        last_hour = now.tm_hour
-                        # 8/21 点催学：只留节奏，不带任何积分色彩
-                        if now.tm_hour in (8, 21):
-                            text = ("【催学】新的一天。今天打算学点啥？"
-                                    "@我 发「我赌+目标」即可入局本周赌约。"
-                                    if now.tm_hour == 8 else
-                                    "【复盘】今晚复盘：今天的赌约推进得怎么样了？"
-                                    "没动静的自己心里有数。")
-                            for gid in wg.known_groups():
-                                self._cron_push(gid, text)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[{self.bot_name}] cron 异常: {exc}", flush=True)
-                time.sleep(30)
-
-        threading.Thread(target=loop, daemon=True).start()
-
-    def _cron_push(self, gid: str, text: str) -> None:
-        ok, err = self._post_retry(
-            f"/v2/groups/{gid}/messages", {"msg_type": 0, "content": text}
-        )
-        if not ok:
-            print(f"[{self.bot_name}] cron 推送失败 {gid}: {err}", flush=True)
 
     def run(self) -> None:
         delay = 5
