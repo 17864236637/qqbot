@@ -197,18 +197,71 @@ def _gen_gguf(prompt: str, system: str = "", temperature: float = 0.85,
     return _clean(text)
 
 
+def _gen_api(prompt: str, system: str, temperature: float,
+             max_tokens: int) -> str:
+    """OpenAI 兼容 HTTP API 后端（DeepSeek / GLM / 硅基流动 / GitHub Models 等）。
+
+    由 .env 三件套配置：
+      QQ_BRAIN_API_BASE  如 https://api.deepseek.com/v1
+      QQ_BRAIN_API_KEY   sk-xxx
+      QQ_BRAIN_API_MODEL 如 deepseek-chat / glm-4-flash（免费档）
+    延迟 import 无依赖；服务器上不装 torch/transformers 也能跑。
+    """
+    base = os.environ.get("QQ_BRAIN_API_BASE", "").rstrip("/")
+    key = os.environ.get("QQ_BRAIN_API_KEY", "")
+    model = os.environ.get("QQ_BRAIN_API_MODEL", "")
+    if not (base and key and model):
+        raise RuntimeError("API 后端未配置（QQ_BRAIN_API_BASE/KEY/MODEL 三缺一）")
+    import json
+    payload = {
+        "model": model,
+        "messages": ([{"role": "system", "content": system}] if system else [])
+                     + [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        base + "/chat/completions", data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + key},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        obj = json.loads(resp.read().decode("utf-8") or "{}")
+    text = (obj["choices"][0]["message"]["content"] or "").strip()
+    if not text:
+        raise RuntimeError(f"API 返回空: {str(obj)[:200]}")
+    return _clean(text)
+
+
 def generate(prompt: str, system: str = "", temperature: float = 0.85,
              max_tokens: int = 220) -> str:
     """生成回复，失败依次降级；全部失败抛 RuntimeError。"""
     errs = []
 
     # 模型优先级选择（环境变量 QQ_BRAIN_MODEL）：
+    #   "api"   → OpenAI 兼容 API 优先（服务器/无本地模型时的首选）
+    #   未指定且 API 三件套已配置 → 同样 API 优先（服务器场景的默认行为）
     #   "minicpm"/"minicpm5" → MiniCPM5-2B 优先（端侧/纯CPU优化，中文原生，8GB 首选）
     #   "ollama"/"llama32"/"llama3.2" → Ollama 本地服务优先（如 llama3.2:3b），失败回退本地
     #   "7b"    → 7B GGUF 优先（质量最好，最慢、最吃内存；CPU 上约 2 tok/s）
     #   "0.5b"  → 0.5B 优先（最小最快，回复随缘，适合恶搞）
     #   其它/空 → 1.5B 优先（默认，质量与开销均衡）
     model_pref = os.environ.get("QQ_BRAIN_MODEL", "").strip().lower()
+
+    # API 后端：服务器上没有模型文件、没 Ollama，这是唯一大脑。
+    # 显式指定了本地型号（7b/1.5b/0.5b/minicpm/ollama）则以本地为先。
+    api_ready = all(os.environ.get(k) for k in
+                    ("QQ_BRAIN_API_BASE", "QQ_BRAIN_API_KEY", "QQ_BRAIN_API_MODEL"))
+    if model_pref == "api" or (not model_pref and api_ready):
+        try:
+            out = _gen_api(prompt, system, temperature, max_tokens)
+            if out:
+                return out
+        except Exception as exc:  # noqa: BLE001
+            errs.append(f"api: {exc}")
+        # 不 return：API 挂了还有本地模型兜底（本地也没模型时由上层兜底文案接住）
 
     # Ollama 优先模式：把本地 Ollama 服务（如 llama3.2:3b）作为首选大脑，
     # 失败再退回本地 transformers/GGUF 兜底。这样"拉到 3B 后"只需改 .env 即可。

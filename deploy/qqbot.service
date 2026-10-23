@@ -1,0 +1,22 @@
+[Unit]
+Description=QQ Supervising Bot (qq_receiver.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 运行用户：由 deploy/install.sh 创建的无登录 shell 系统用户
+User=qqbot
+WorkingDirectory=/opt/qqbot
+# .env 为 KEY=VALUE 无引号格式，systemd EnvironmentFile 直接支持
+EnvironmentFile=/opt/qqbot/.env
+ExecStart=/usr/bin/python3 /opt/qqbot/qq_receiver.py
+# 保活就靠 systemd，不要再套 qq_watchdog.sh（nohup 双层保活会重复拉起）
+Restart=always
+RestartSec=5
+# 日志直接追加到文件：tail -f 方便，重启/轮转不丢，不依赖 journald
+StandardOutput=append:/opt/qqbot/receiver.log
+StandardError=append:/opt/qqbot/receiver.log
+
+[Install]
+WantedBy=multi-user.target
