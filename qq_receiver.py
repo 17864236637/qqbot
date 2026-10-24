@@ -307,6 +307,17 @@ class Receiver:
         except Exception as exc:
             # 入群系统炸了不能拖死聊天：放行大模型，日志留痕
             print(f"[{self.bot_name}] 入群系统异常（放行大模型）: {exc}", flush=True)
+        # 入群系统排队中的私聊通知（点单/接单/完结）在这里发给对应的人
+        try:
+            import qq_hr
+            for to_openid, text in qq_hr.pop_notifs():
+                ok, err = self._post_retry(
+                    f"/v2/users/{to_openid}/messages",
+                    {"msg_type": 2, "markdown": {"content": text}})
+                print(f"[{self.bot_name}] 私聊通知 → {to_openid[:8]}…"
+                      f"({'成功' if ok else '失败:' + str(err)})", flush=True)
+        except Exception as exc:
+            print(f"[{self.bot_name}] 私聊通知发送异常: {exc}", flush=True)
         if not reply:
             try:
                 from qq_brain import generate
