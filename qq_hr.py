@@ -411,7 +411,8 @@ def _answer(openid: str, name: str, text: str) -> str:
         return (f"恭喜，「{app['role']}」入群通过！已记入花名册并上架点单看板。\n"
                 f"业务范围：{app['qa'].get('scope', '未提供')}\n"
                 f"定价：{app['qa'].get('price', '未提供')}（学员实付，群方收 25%）\n"
-                f"请搜索 QQ 群号 {MAIN_GROUP_NO} 加入主群（进群后备注你的岗位）。")
+                f"接下来群主会拉你进对应的工作安排，留意群通知。\n"
+                f"主群群号：{MAIN_GROUP_NO}（QQ 搜索该群号加入，进群后备注你的岗位）")
     return f"很遗憾，「{app['role']}」入群未通过。\n原因：{reason}\n（有异议找群主）"
 
 
