@@ -161,13 +161,18 @@ def _gen_gguf(prompt: str, system: str = "", temperature: float = 0.85,
 
     # 模型或模板变化时重建实例
     if _GGUF_LLM is None or _GGUF_PATH != gguf or _GGUF_FORMAT != chat_format:
-        # use_mmap=True（实测可行）：mmap 不一次性占满物理内存，8GB cgroup 下
-        # 不会 OOM；缺点是慢磁盘按需 page-in 时偏慢。若已预热 page cache 则接近纯 CPU 速度。
-        # （之前用 use_mmap=False 在沙箱 8GB 限制下会被 OOM killer 静默杀死。）
+        # use_mmap=True（实测可行）：不一次性占满物理内存，不会 OOM；
+        # 缺点是慢磁盘按需 page-in 时偏慢。若已预热 page cache 则接近纯 CPU 速度。
+        # 线程数：默认 半核（llama.cpp 实测超过 16 线程收益递减且个别 build 会崩），
+        # 可用 QQ_GGUF_THREADS 覆盖。
+        # （2026-10-24 事故记录：沙箱被迁到只支持 AVX2 的宿主机，PyPI 预编译 wheel
+        #  的 AVX512 代码路径 SIGILL 崩溃（core dump），而 torch 路径因运行时 CPU
+        #  检测无恙。修复=源码重装并 -DGGML_AVX512=OFF，详见 deploy/README.md。）
         _GGUF_LLM = Llama(
             model_path=gguf,
             n_ctx=2048,
-            n_threads=max(1, (os.cpu_count() or 8) // 2),
+            n_threads=int(os.environ.get("QQ_GGUF_THREADS")
+                          or max(1, (os.cpu_count() or 8) // 2)),
             n_batch=512,
             use_mmap=True,
             verbose=False,
