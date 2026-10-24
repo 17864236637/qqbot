@@ -44,6 +44,9 @@ _lock = threading.RLock()
 # 群方服务费率：学员实付价里群内收取的比例（申请人实得 1-0.25）。
 FEE_RATE = 0.25
 
+# 主群群号：审核通过者按此搜索加群（群机器人无拉人 API，只能引导）。
+MAIN_GROUP_NO = "1125939804"
+
 # ---------- 校验器：题目答案的格式关卡 ----------
 VALIDATORS = {
     "nonempty": ("这项不能为空，重新答", lambda v: bool(v.strip())),
@@ -252,7 +255,7 @@ def is_entry(text: str) -> bool:
     t = _norm(text)
     return t in _ENTRY_WORDS + _LIST_WORDS + ("花名册", "订单列表") + _CANCEL_WORDS \
         or parse_role(t) is not None \
-        or t in ("点单", "接单", "拒单", "我的订单") \
+        or t in ("点单", "接单", "拒单", "我的订单", "主群") \
         or re.match(r"^点单\s*\d{1,2}$", t) \
         or re.match(r"^完结\s*\d{1,2}$", t) \
         or t.startswith("拉黑") or t.startswith("解黑")
@@ -283,6 +286,9 @@ def hr_handle(openid: str, name: str, text: str, is_admin: bool = False) -> str 
     # 学员点单
     if t == "点单":
         return _order_menu()
+    if t == "主群":
+        return (f"主群群号：{MAIN_GROUP_NO}\n"
+                f"QQ 搜索该群号申请加入；进群后按群主要求备注你的岗位。")
     m = re.match(r"^点单\s*(\d{1,2})$", t)
     if m:
         return _place_order(openid, name, int(m.group(1)))
@@ -405,7 +411,7 @@ def _answer(openid: str, name: str, text: str) -> str:
         return (f"恭喜，「{app['role']}」入群通过！已记入花名册并上架点单看板。\n"
                 f"业务范围：{app['qa'].get('scope', '未提供')}\n"
                 f"定价：{app['qa'].get('price', '未提供')}（学员实付，群方收 25%）\n"
-                f"接下来群主会拉你进对应的工作安排，留意群通知。")
+                f"请搜索 QQ 群号 {MAIN_GROUP_NO} 加入主群（进群后备注你的岗位）。")
     return f"很遗憾，「{app['role']}」入群未通过。\n原因：{reason}\n（有异议找群主）"
 
 
@@ -588,6 +594,7 @@ def _admin_cmd(t: str, admin_name: str) -> str:
                 lines.append(f"— {cur} —")
             lines.append(f"· {it['name']}｜{it['scope']}｜{it['price']}"
                          f"（{it['since'][:10]} 入群）")
+        lines.append(f"主群群号：{MAIN_GROUP_NO}（通过者搜索此号进群）")
         return "\n".join(lines)
 
     if t in _LIST_WORDS:
