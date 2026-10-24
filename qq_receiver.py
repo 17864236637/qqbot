@@ -282,21 +282,31 @@ class Receiver:
             remember(user_openid, intro, scope)
             print(f"[{self.bot_name}] 已记住 {user_openid[:8]}… 叫 {intro}", flush=True)
         name = get_name(user_openid)
-        # ---- 入职审核系统（命令拦截型：命中即接管，不调大模型，毫秒级） ----
+        # ---- 入群审核系统（命令拦截型：命中即接管，不调大模型，毫秒级） ----
         # 岗位申请/问卷作答/管理命令全在这里闭环；未命中返回 None，放行大模型。
         reply = None
         try:
             import qq_hr
+            # 管理员身份：群消息认 member_role（owner 也算——QQ 对群主下发的是
+            # owner 不是 admin，只认 admin 会把群主挡在自家门外）；
+            # 私聊没有角色字段，靠 qq_hr 缓存的群主/管理员 openid 认人。
+            uid = user_openid or ("anon:" + (msg.get("id") or "?"))
+            member_role = author.get("member_role")
+            is_admin = member_role in ("admin", "owner")
+            if member_role:
+                qq_hr.note_admin(uid, member_role)
+            elif qq_hr.is_known_admin(uid):
+                is_admin = True
             hr_out = qq_hr.hr_handle(
-                user_openid or ("anon:" + (msg.get("id") or "?")),
+                uid,
                 name or author.get("username") or "群友",
-                content, is_admin=(author.get("member_role") == "admin"))
+                content, is_admin=is_admin)
             if hr_out:
                 reply = hr_out
-                print(f"[{self.bot_name}] 入职系统接管: {content!r}", flush=True)
+                print(f"[{self.bot_name}] 入群系统接管: {content!r}", flush=True)
         except Exception as exc:
-            # 入职系统炸了不能拖死聊天：放行大模型，日志留痕
-            print(f"[{self.bot_name}] 入职系统异常（放行大模型）: {exc}", flush=True)
+            # 入群系统炸了不能拖死聊天：放行大模型，日志留痕
+            print(f"[{self.bot_name}] 入群系统异常（放行大模型）: {exc}", flush=True)
         if not reply:
             try:
                 from qq_brain import generate

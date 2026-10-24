@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""入职审核系统：陪玩 / 陪聊 / 树洞 / 代肝 / 监督员 五线入职。
+"""入群审核系统：陪玩 / 陪聊 / 树洞 / 代肝 / 监督员 五线入群。
 
 定位（务必理解，别再跑偏）：
-- 本模块管「人」的入职：申请 → 分线问卷 → 自动初筛 → 通过/拒绝 → 花名册。
+- 本模块管「人」的入群：申请 → 分线问卷 → 自动初筛 → 通过/拒绝 → 花名册。
   不管派单、不管经手资金（押金类岗位只做"知悉确认"，钱的事群主线下处理）。
 - 命令拦截型：关键词命中即接管对话，不调用大模型，毫秒级、确定性强。
 - 状态全部持久化到 qq_staff.json（进程会死，申请不能丢；原子写防半截文件）。
 
 用法（群/私聊均可发起）：
-  入职                列出岗位与用法
-  入职<岗位>           开始该岗位问卷（如：入职陪玩）
+  入群                列出岗位与用法
+  入群<岗位>           开始该岗位问卷（如：入群陪玩）
   （私聊中逐题作答，格式错会要求重答）
-  取消入职             放弃当前申请
+  取消入群             放弃当前申请
 管理命令（member_role=admin 限定）：
-  入职列表 / 花名册 / 拉黑 <QQ或昵称> <原因> / 解黑 <QQ或昵称>
+  入群列表 / 花名册 / 拉黑 <QQ或昵称> <原因> / 解黑 <QQ或昵称>
 
 问卷题目在 ROLES/COMMON_QUESTIONS 里改文本即可，无需动逻辑。
 自动初筛规则见 _evaluate：黑名单 → 重复在职 → 年龄门槛 → 格式（状态机已保证）。
@@ -28,6 +28,7 @@ import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE, "qq_staff.json")
+ADMIN_FILE = os.path.join(BASE, "qq_admins.json")
 
 _lock = threading.Lock()
 
@@ -142,6 +143,34 @@ def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ---------- 管理员身份缓存 ----------
+# 群消息带 member_role（群主是 owner、管理员是 admin），私聊不带这个字段。
+# 群主在私聊里发管理命令时，靠这个缓存认人——只认在群里被官方标记过
+# 管理身份的人，安全边界不变（陌生人私聊发"拉黑"照样被挡）。
+def note_admin(openid: str, member_role: str) -> None:
+    if member_role in ("admin", "owner") and openid:
+        with _lock:
+            try:
+                with open(ADMIN_FILE, encoding="utf-8") as f:
+                    known = set(json.load(f))
+            except (OSError, ValueError):
+                known = set()
+            if openid not in known:
+                known.add(openid)
+                tmp = ADMIN_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(sorted(known), f, ensure_ascii=False)
+                os.replace(tmp, ADMIN_FILE)
+
+
+def is_known_admin(openid: str) -> bool:
+    try:
+        with open(ADMIN_FILE, encoding="utf-8") as f:
+            return openid in set(json.load(f))
+    except (OSError, ValueError):
+        return False
+
+
 def _questions_for(role: str) -> list:
     return COMMON_QUESTIONS + ROLES[role]["questions"]
 
@@ -152,25 +181,25 @@ def _norm(text: str) -> str:
 
 
 def parse_role(text: str) -> str | None:
-    """从消息里解析岗位名：'入职陪玩' → '陪玩'；支持别名（拼音/缩写不搞，防误触）。"""
+    """从消息里解析岗位名：'入群陪玩' → '陪玩'；支持别名（拼音/缩写不搞，防误触）。"""
     t = _norm(text)
-    m = re.match(r"^入职\s*([一-龥A-Za-z0-9]{1,6})$", t)
+    m = re.match(r"^入群\s*([一-龥A-Za-z0-9]{1,6})$", t)
     if not m:
         return None
     return m.group(1) if m.group(1) in ROLES else None
 
 
 def is_entry(text: str) -> bool:
-    """是否入职系统的入口词（精确匹配，防日常聊天误触）。"""
+    """是否入群系统的入口词（精确匹配，防日常聊天误触）。"""
     t = _norm(text)
-    return t in ("入职", "入职列表", "花名册", "取消入职") \
+    return t in ("入群", "入群列表", "花名册", "取消入群") \
         or parse_role(t) is not None \
         or t.startswith("拉黑") or t.startswith("解黑")
 
 
 # ---------- 核心流程 ----------
 def hr_handle(openid: str, name: str, text: str, is_admin: bool = False) -> str | None:
-    """receiver 的接线点：命中入职系统返回文案，否则返回 None（放行给大模型）。
+    """receiver 的接线点：命中入群系统返回文案，否则返回 None（放行给大模型）。
 
     openid  用户 openid（群/私聊通用主键）
     name    展示名（群名片/昵称）
@@ -181,12 +210,12 @@ def hr_handle(openid: str, name: str, text: str, is_admin: bool = False) -> str 
         return None
 
     # 管理命令优先
-    if t in ("入职列表", "花名册") or t.startswith("拉黑") or t.startswith("解黑"):
+    if t in ("入群列表", "花名册") or t.startswith("拉黑") or t.startswith("解黑"):
         if not is_admin:
             return "这是管理命令，仅群主/管理员可用。"
         return _admin_cmd(t, name)
 
-    if t == "取消入职":
+    if t == "取消入群":
         return _cancel(openid)
 
     # 已有进行中的申请 → 本轮消息按答卷处理；
@@ -195,9 +224,9 @@ def hr_handle(openid: str, name: str, text: str, is_admin: bool = False) -> str 
         d = _load()
         pend = d["applications"].get(openid)
     if pend is not None and pend.get("status") == "pending":
-        if parse_role(t) or t in ("入职", "取消入职"):
+        if parse_role(t) or t in ("入群", "取消入群"):
             return (f"你有一份「{pend['role']}」的申请还没答完"
-                    f"（第{pend['step'] + 1}题）。先答完，或发送「取消入职」"
+                    f"（第{pend['step'] + 1}题）。先答完，或发送「取消入群」"
                     f"放弃后再申请新岗位。")
         return _answer(openid, name, t)
 
@@ -205,18 +234,18 @@ def hr_handle(openid: str, name: str, text: str, is_admin: bool = False) -> str 
     if role:
         return _start(openid, name, role)
 
-    if t == "入职":
+    if t == "入群":
         return _menu()
     return None
 
 
 def _menu() -> str:
-    lines = ["【入职中心】当前开放岗位："]
+    lines = ["【入群中心】当前开放岗位："]
     for r in ROLES:
         lines.append(f"· {r}——{ROLES[r]['desc']}")
     lines.append("")
-    lines.append("发送「入职+岗位名」开始申请，如：入职陪玩")
-    lines.append("申请中发送「取消入职」可放弃；题目在私聊里逐题作答")
+    lines.append("发送「入群+岗位名」开始申请，如：入群陪玩")
+    lines.append("申请中发送「取消入群」可放弃；题目在私聊里逐题作答")
     return "\n".join(lines)
 
 
@@ -226,26 +255,26 @@ def _start(openid: str, name: str, role: str) -> str:
         # 黑名单（openid 或花名册历史联系方式都查不了太多，先按 openid+昵称）
         for b in d["blacklist"]:
             if openid == b.get("openid") or name == b.get("qq"):
-                return (f"申请被拒绝：你在入职黑名单中"
+                return (f"申请被拒绝：你在入群黑名单中"
                         f"（{b.get('reason', '原因未填')}）。"
                         f"有异议请联系群主。")
         # 已在职同岗位
         st = d["staff"].get(openid)
         if st and role in st.get("roles", []):
-            return f"你已经是「{role}」了，不用重复入职。想换岗位直接申请新的。"
+            return f"你已经是「{role}」了，不用重复入群。想换岗位直接申请新的。"
         # 已有进行中的申请
         old = d["applications"].get(openid)
         if old is not None and old.get("status") == "pending":
             return (f">你有一份「{old['role']}」的申请还没答完"
-                    f"（第{old['step'] + 1}题）。继续答，或发送「取消入职」放弃。")
+                    f"（第{old['step'] + 1}题）。继续答，或发送「取消入群」放弃。")
         d["applications"][openid] = {
             "name": name, "role": role, "qa": {}, "step": 0,
             "status": "pending", "reason": "", "ts": _now(),
         }
         _save(d)
     q = _questions_for(role)[0]
-    return (f"【{role}】入职申请开始，共{_qcount(role)}题。\n"
-            f"{q['text']}\n（答错格式我会提醒重答；随时可「取消入职」）")
+    return (f"【{role}】入群申请开始，共{_qcount(role)}题。\n"
+            f"{q['text']}\n（答错格式我会提醒重答；随时可「取消入群」）")
 
 
 def _qcount(role: str) -> int:
@@ -286,9 +315,9 @@ def _answer(openid: str, name: str, text: str) -> str:
                              "ts": app["result_ts"]})
         _save(d)
     if passed:
-        return (f"恭喜，「{app['role']}」入职通过！已记入花名册。\n"
+        return (f"恭喜，「{app['role']}」入群通过！已记入花名册。\n"
                 f"接下来群主会拉你进对应的工作安排，留意群通知。")
-    return f"很遗憾，「{app['role']}」入职未通过。\n原因：{reason}\n（有异议找群主）"
+    return f"很遗憾，「{app['role']}」入群未通过。\n原因：{reason}\n（有异议找群主）"
 
 
 def _evaluate(app: dict, d: dict) -> tuple[bool, str]:
@@ -322,14 +351,14 @@ def _cancel(openid: str) -> str:
         d = _load()
         app = d["applications"].get(openid)
         if app is None or app.get("status") != "pending":
-            return "你当前没有进行中的入职申请。"
+            return "你当前没有进行中的入群申请。"
         app["status"] = "canceled"
         app["result_ts"] = _now()
         d["history"].append({"openid": openid, "name": app.get("name", "?"),
                              "role": app["role"], "status": "canceled",
                              "reason": "本人取消", "ts": app["result_ts"]})
         _save(d)
-    return "已取消本次入职申请。想重新开始随时发送「入职+岗位名」。"
+    return "已取消本次入群申请。想重新开始随时发送「入群+岗位名」。"
 
 
 # ---------- 管理命令 ----------
@@ -343,10 +372,10 @@ def _admin_cmd(t: str, admin_name: str) -> str:
         lines = ["【花名册】"]
         for oid, st in staff.items():
             lines.append(f"· {st.get('name', '?')}：{'、'.join(st.get('roles', []))}"
-                         f"（{st.get('since', '?')[:10]} 入职）")
+                         f"（{st.get('since', '?')[:10]} 入群）")
         return "\n".join(lines)
 
-    if t == "入职列表":
+    if t == "入群列表":
         with _lock:
             d = _load()
             apps = [a for a in d["applications"].values()
@@ -359,7 +388,7 @@ def _admin_cmd(t: str, admin_name: str) -> str:
                 lines.append(f"· {a['name']} → {a['role']}（第{a['step'] + 1}题，"
                              f"{a['ts'][5:16]} 发起）")
         else:
-            lines.append("当前没有待处理的入职申请。")
+            lines.append("当前没有待处理的入群申请。")
         if recent:
             lines.append("")
             lines.append("【最近5条终态】")
@@ -380,7 +409,7 @@ def _admin_cmd(t: str, admin_name: str) -> str:
             d["blacklist"].append({"qq": target, "reason": reason,
                                    "by": admin_name, "ts": _now()})
             _save(d)
-        return f"已拉黑「{target}」（{reason}）。此后再发起入职会被自动拒绝。"
+        return f"已拉黑「{target}」（{reason}）。此后再发起入群会被自动拒绝。"
 
     m = re.match(r"^解黑\s*(\S+)$", t)
     if m:
