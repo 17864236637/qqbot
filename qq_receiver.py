@@ -282,9 +282,25 @@ class Receiver:
             remember(user_openid, intro, scope)
             print(f"[{self.bot_name}] 已记住 {user_openid[:8]}… 叫 {intro}", flush=True)
         name = get_name(user_openid)
+        # ---- 入职审核系统（命令拦截型：命中即接管，不调大模型，毫秒级） ----
+        # 岗位申请/问卷作答/管理命令全在这里闭环；未命中返回 None，放行大模型。
+        reply = None
         try:
-            from qq_brain import generate
-            reply = generate(
+            import qq_hr
+            hr_out = qq_hr.hr_handle(
+                user_openid or ("anon:" + (msg.get("id") or "?")),
+                name or author.get("username") or "群友",
+                content, is_admin=(author.get("member_role") == "admin"))
+            if hr_out:
+                reply = hr_out
+                print(f"[{self.bot_name}] 入职系统接管: {content!r}", flush=True)
+        except Exception as exc:
+            # 入职系统炸了不能拖死聊天：放行大模型，日志留痕
+            print(f"[{self.bot_name}] 入职系统异常（放行大模型）: {exc}", flush=True)
+        if not reply:
+            try:
+                from qq_brain import generate
+                reply = generate(
                 f"对方说：{content}" + (f"（记住：对方叫 {name}，直接称呼其名）"
                                        if name else "（你还不知道对方名字，不要编造，用'你'称呼即可）"),
                 system=(
@@ -298,9 +314,9 @@ class Receiver:
                 ),
                 max_tokens=60, temperature=0.7,
             )
-        except Exception as exc:
-            print(f"[{self.bot_name}] 大脑失败: {exc}", flush=True)
-            reply = "我在的，有什么事？"
+            except Exception as exc:
+                print(f"[{self.bot_name}] 大脑失败: {exc}", flush=True)
+                reply = "我在的，有什么事？"
         if not reply:
             reply = "我在的。"
         if group_id:
