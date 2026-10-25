@@ -1,0 +1,17 @@
+# 构建上下文瘦身：仓库里躺着几个 GB 的模型权重目录和日志，
+# 虽然 Dockerfile 是逐个 COPY 源码，上下文过大仍会拖慢/撑爆构建。
+.env
+*.log
+*.jsonl
+qq_*.json
+qwen_model/
+qwen15_model/
+qwen7b_gguf/
+qwen7b_model/
+deepseek_model/
+minicpm5_model/
+minicpm5_gguf/
+__pycache__/
+*.pyc
+core.*
+.git/
