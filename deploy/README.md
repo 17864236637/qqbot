@@ -94,7 +94,7 @@ cat > ~/.termux/boot/start-qqbot.sh <<'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
 cd ~/qqbot
 while true; do
-  python3 qq_receiver.py >> receiver.log 2>&1
+  python3 -u qq_receiver.py >> receiver.log 2>&1
   sleep 5
 done
 EOF

@@ -152,7 +152,7 @@ while true; do
   fi
 
   cd "$DIR" || { log "无法进入 $DIR，看门狗退出"; exit 1; }
-  nohup python3 qq_receiver.py >> receiver.log 2>&1 &
+  nohup python3 -u qq_receiver.py >> receiver.log 2>&1 &
   new_pid=$!
   echo "$new_pid" > "$PIDFILE"
   LAST_START="$(date +%s)"
