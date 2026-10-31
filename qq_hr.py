@@ -262,21 +262,38 @@ def is_entry(text: str) -> bool:
 
 
 # ---------- 核心流程 ----------
-def hr_handle(openid: str, name: str, text: str, is_admin: bool = False) -> str | None:
+def hr_handle(openid: str, name: str, text: str, is_admin: bool = False,
+              is_owner: bool = False) -> str | None:
     """receiver 的接线点：命中入群系统返回文案，否则返回 None（放行给大模型）。
 
     openid  用户 openid（群/私聊通用主键）
     name    展示名（群名片/昵称）
     is_admin 群消息里 member_role in (admin, owner)，或私聊缓存命中的群主/管理员
+    is_owner 是否主人（QQ_OWNER_OPENID 命中）；主人自动拥有管理员权限，
+             且独占拉黑/解黑这类重罚命令
     """
     t = _norm(text)
     if not t:
         return None
 
-    # 管理命令优先
-    if t in _LIST_WORDS + ("花名册", "订单列表") \
-            or t.startswith("拉黑") or t.startswith("解黑"):
-        if not is_admin:
+    # 主人查询：只回绑定状态，不吐完整 openid
+    if t in ("主人是谁", "谁是主人"):
+        try:
+            import qq_owner
+            desc = qq_owner.describe()
+        except Exception:  # noqa: BLE001
+            desc = "主人模块没加载上，检查 qq_owner.py"
+        return desc + ("——就是你啊，我的主人。" if is_owner else "")
+
+    # 重罚类命令：主人独占（拉黑会直接把真人挡在群外，管理员滥用代价太大）
+    if t.startswith("拉黑") or t.startswith("解黑"):
+        if not is_owner:
+            return "拉黑/解黑是主人的专属权限，管理员也动不了～"
+        return _admin_cmd(t, name)
+
+    # 只读管理命令：管理员即可（主人天然算管理员）
+    if t in _LIST_WORDS + ("花名册", "订单列表"):
+        if not (is_admin or is_owner):
             return "这是管理命令，仅群主/管理员可用。"
         return _admin_cmd(t, name)
 

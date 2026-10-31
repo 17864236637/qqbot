@@ -297,10 +297,24 @@ class Receiver:
                 qq_hr.note_admin(uid, member_role)
             elif qq_hr.is_known_admin(uid):
                 is_admin = True
+            # 主人：按 openid 绑定（见 qq_owner.py）。主人天然是管理员，
+            # 且独占拉黑/解黑；主人模块炸了按"非主人"处理，绝不拖死聊天。
+            is_owner = False
+            owner_label = ""
+            try:
+                import qq_owner
+                is_owner = qq_owner.is_owner(user_openid)
+                owner_label = qq_owner.owner_name()
+                if is_owner:
+                    is_admin = True
+                    print(f"[{self.bot_name}] 主人发言：{owner_label}", flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{self.bot_name}] 主人模块异常（按非主人处理）: {exc}",
+                      flush=True)
             hr_out = qq_hr.hr_handle(
                 uid,
                 name or author.get("username") or "群友",
-                content, is_admin=is_admin)
+                content, is_admin=is_admin, is_owner=is_owner)
             if hr_out:
                 reply = hr_out
                 print(f"[{self.bot_name}] 入群系统接管: {content!r}", flush=True)
@@ -325,13 +339,21 @@ class Receiver:
                 f"对方说：{content}" + (f"（记住：对方叫 {name}，直接称呼其名）"
                                        if name else "（你还不知道对方名字，不要编造，用'你'称呼即可）"),
                 system=(
+                    ((f"对方是你的主人「{owner_label}」——你最该盯的人，也是你最服的人。"
+                      f"态度可以软一点、黏一点，但毒舌本色别丢。")
+                     if is_owner else "")
+                    +
                     (f"你是「{self.bot_name}」——群里同学的学习搭子，嘴毒但真希望他们好。"
                      f"风格：毒舌但暖、有梗、带中二、爱call名字，不爹味。最多两句话。"
                      f"只给消息正文，不要引号、不要'好的'之类废话。")
                     if group_id else
-                    (f"你是「{self.bot_name}」——专门监督好好学习的毒舌小助手，核心算法是'监督学习'（监督的是人的学习）。"
-                     f"风格：毒舌但暖、有梗、带中二、爱call对方名字、偶尔甩热词，绝不爹味说教，最多两句话。"
-                     f"用最短的话把人从摸鱼/躺平里拽起来。不涉及扣分与记账，只催学。只给消息正文，不要引号、不要'好的'之类废话。")
+                    (((f"对方是你的主人「{owner_label}」——你最该盯的人，也是你最服的人。"
+                       f"态度可以软一点、黏一点，但毒舌本色别丢。")
+                      if is_owner else "")
+                     +
+                     (f"你是「{self.bot_name}」——专门监督好好学习的毒舌小助手，核心算法是'监督学习'（监督的是人的学习）。"
+                      f"风格：毒舌但暖、有梗、带中二、爱call对方名字、偶尔甩热词，绝不爹味说教，最多两句话。"
+                      f"用最短的话把人从摸鱼/躺平里拽起来。不涉及扣分与记账，只催学。只给消息正文，不要引号、不要'好的'之类废话。"))
                 ),
                 max_tokens=60, temperature=0.7,
             )

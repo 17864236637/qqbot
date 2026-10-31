@@ -22,12 +22,25 @@ import qq_time  # 时间校准 + 时段识别（导入即锁定 TZ=Asia/Shanghai
 BASE = os.path.dirname(os.path.abspath(__file__))
 WATCHLIST = os.path.join(BASE, "qq_watchlist.json")
 ENV_FILE = os.path.join(BASE, ".env")
-SYSTEM_PROMPT = (
-    "你是「QQ监督员」，桉柠的专属监督搭子。任务：用最短的话把人从摸鱼/躺平里拽起来——该学学、该睡睡。"
-    "风格：毒舌但暖、有梗、带点中二、爱call对方名字、偶尔甩网络热词，绝不爹味说教，最多两句话。"
-    "示例：「桉柠你又摸鱼！起来搞学习，不然今晚别想睡。」"
-    "用中文输出，只给消息正文本身，不要引号、不要解释、不要『好的』这类废话、不要重复对方名字超过一次。"
-)
+
+
+def system_prompt() -> str:
+    """主人可配置的人设。
+
+    主人名从 .env 的 QQ_OWNER_NAME 读（见 qq_owner.py）；未配置时回退到
+    「桉柠」，与改动前的硬编码完全一致，所以不配主人也不影响线上行为。
+    """
+    try:
+        import qq_owner
+        owner = qq_owner.owner_name()
+    except Exception:  # noqa: BLE001  主人模块炸了不能拖死推送
+        owner = "桉柠"
+    return (
+        f"你是「QQ监督员」，{owner}的专属监督搭子。任务：用最短的话把人从摸鱼/躺平里拽起来——该学学、该睡睡。"
+        "风格：毒舌但暖、有梗、带点中二、爱call对方名字、偶尔甩网络热词，绝不爹味说教，最多两句话。"
+        f"示例：「{owner}你又摸鱼！起来搞学习，不然今晚别想睡。」"
+        "用中文输出，只给消息正文本身，不要引号、不要解释、不要『好的』这类废话、不要重复对方名字超过一次。"
+    )
 
 
 def load_env() -> None:
@@ -62,7 +75,7 @@ def craft_message(bot_name: str, name: str, base_text: str,
     title = f"{bot_name}·{period_name}" if period_name else bot_name
     try:
         from qq_brain import generate
-        out = generate(build_prompt(name, base_text, hint), system=SYSTEM_PROMPT)
+        out = generate(build_prompt(name, base_text, hint), system=system_prompt())
         if out:
             return f"## {title}\n> {ts}\n\n{out}"
     except Exception as exc:  # noqa: BLE001
@@ -128,6 +141,14 @@ def push_once(bot: QQBot, wl: dict, bot_name: str, text: str) -> tuple[list, lis
         if not oid:
             print(f"  ⏭  {name}: openid 为空，跳过", flush=True)
             continue
+        # 主人免疫监督：催谁都不催自家主人（SUPERVISE 打开时才走得到这里）
+        try:
+            import qq_owner
+            if qq_owner.is_owner(oid):
+                print(f"  ⏭  {name}: 是主人，免疫监督推送", flush=True)
+                continue
+        except Exception:  # noqa: BLE001
+            pass
         body = craft_message(bot_name, name, text, period_name, hint)
         ok, res = _send_with_retry(
             bot, oid, {"msg_type": 2, "markdown": {"content": body}})
