@@ -403,7 +403,8 @@ class Receiver:
                                 reply = "这条指令只有管理员能用。"
                             else:
                                 reply = cmd.get("reply") or ""
-                                auto_recall = int(cmd.get("autodel") or 0)
+                                auto_recall = int(cmd.get("autodel") or 0) \
+                                    or qq_cmds.default_autodel()
                                 qq_cmds.hit(key)
                                 print(f"[{self.bot_name}] 自定义指令命中: {key}"
                                       f"{f'（{auto_recall}s 后撤回）' if auto_recall else ''}",

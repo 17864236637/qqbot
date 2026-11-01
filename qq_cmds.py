@@ -70,6 +70,19 @@ def all_cmds() -> dict:
     return _load()["cmds"]
 
 
+def default_autodel() -> int:
+    """全局默认撤回秒数，来自 .env 的 QQ_AUTODEL_SEC（0 = 不撤）。
+
+    自定义指令**没单独设** autodel 时套用；指令自己写了 autodel=N 就以 N 为准。
+    只作用于自定义指令回复——闲聊/监督推送/点单不走这条路径。
+    """
+    try:
+        v = int(os.environ.get("QQ_AUTODEL_SEC", "0"))
+    except ValueError:
+        return 0
+    return v if v > 0 else 0
+
+
 def match(text: str) -> tuple[str, dict] | None:
     """文本 -> (关键词, 指令) 命中则返回，否则 None。整条消息精确匹配。"""
     key = _norm_key(text)
@@ -99,8 +112,8 @@ def add(keyword: str, reply: str, by: str = "", by_name: str = "",
         return False, "回复内容不能为空"
     if len(reply) > _MAX_REPLY:
         return False, f"回复内容太长（上限 {_MAX_REPLY} 字）"
-    if autodel and not (1 <= autodel <= 120):
-        return False, "自动撤回延迟要在 1~120 秒之间"
+    if autodel and not (1 <= autodel <= 86400):
+        return False, "自动撤回延迟要在 1~86400 秒之间（最长 24 小时）"
     with _lock:
         d = _load()
         if key in d["cmds"]:
@@ -198,6 +211,9 @@ def list_text() -> str:
         preview = c.get("reply", "")
         preview = preview if len(preview) <= 24 else preview[:24] + "…"
         lines.append(f"• /{k} → {preview}{tail}")
+    dflt = default_autodel()
+    if dflt:
+        lines.append(f"（未单独设 autodel 的指令，默认 {dflt} 秒后自动撤回）")
     return "\n".join(lines)
 
 
