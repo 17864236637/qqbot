@@ -97,6 +97,7 @@ class Receiver:
         self.hb_interval = 30
         self.alive = True
         self.seen_msg_ids = set()  # 去重：防止沙箱/网络重推导致重复回复
+        self._started = time.time()  # 进程启动时间（/uptime 用）
         self._last_recv = time.monotonic()  # 最近一次收到 WS 帧的时间（僵尸会话检测）
         self._hb_ws = None                  # 当前心跳线程服务的 ws（防旧线程泄漏）
         self.bot_id = None                  # 机器人自身 ID（READY 下发），全量模式判 @ 用
@@ -326,45 +327,55 @@ class Receiver:
         # 岗位申请/问卷作答/管理命令全在这里闭环；未命中返回 None，放行大模型。
         reply = None
         auto_recall = 0     # 本条回复的自动撤回延迟（秒），指令配了 autodel 才非 0
+        import qq_hr  # 身份识别依赖（note_admin / is_known_admin）
+        # ---- 身份识别（提前计算，供元命令与人设共用） ----
+        uid = user_openid or ("anon:" + (msg.get("id") or "?"))
+        member_role = author.get("member_role")
+        is_admin = member_role in ("admin", "owner")
+        if member_role:
+            qq_hr.note_admin(uid, member_role)
+        elif qq_hr.is_known_admin(uid):
+            is_admin = True
+        is_owner = False
+        owner_label = ""
         try:
-            import qq_hr
-            # 管理员身份：群消息认 member_role（owner 也算——QQ 对群主下发的是
-            # owner 不是 admin，只认 admin 会把群主挡在自家门外）；
-            # 私聊没有角色字段，靠 qq_hr 缓存的群主/管理员 openid 认人。
-            uid = user_openid or ("anon:" + (msg.get("id") or "?"))
-            member_role = author.get("member_role")
-            is_admin = member_role in ("admin", "owner")
-            if member_role:
-                qq_hr.note_admin(uid, member_role)
-            elif qq_hr.is_known_admin(uid):
+            import qq_owner, qq_meta
+            is_owner = qq_meta.is_owner_any(user_openid)
+            owner_label = qq_owner.owner_name()
+            if is_owner:
                 is_admin = True
-            # 主人：按 openid 绑定（见 qq_owner.py）。主人天然是管理员，
-            # 且独占拉黑/解黑；主人模块炸了按"非主人"处理，绝不拖死聊天。
-            is_owner = False
-            owner_label = ""
-            try:
-                import qq_owner
-                is_owner = qq_owner.is_owner(user_openid)
-                owner_label = qq_owner.owner_name()
-                if is_owner:
-                    is_admin = True
-                    print(f"[{self.bot_name}] 主人发言：{owner_label}", flush=True)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[{self.bot_name}] 主人模块异常（按非主人处理）: {exc}",
-                      flush=True)
-            # "/" 前缀是自定义指令的门槛，但对内置命令必须透明——否则 "/入群"
-            # 进不了内置流程，会一路漏到自定义指令甚至大脑，连权限都能绕过去。
+                print(f"[{self.bot_name}] 主人发言：{owner_label}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self.bot_name}] 身份模块异常（按非主人处理）: {exc}",
+                  flush=True)
+        # ---- 元命令层（最高优先级，避免被入群系统/自定义指令吞掉） ----
+        try:
+            import qq_meta
             cmd_text = content[1:].strip() if content.startswith("/") else content
-            hr_out = qq_hr.hr_handle(
-                uid,
-                name or author.get("username") or "群友",
-                cmd_text, is_admin=is_admin, is_owner=is_owner)
-            if hr_out:
-                reply = hr_out
-                print(f"[{self.bot_name}] 入群系统接管: {content!r}", flush=True)
-        except Exception as exc:
-            # 入群系统炸了不能拖死聊天：放行大模型，日志留痕
-            print(f"[{self.bot_name}] 入群系统异常（放行大模型）: {exc}", flush=True)
+            meta_out = qq_meta.handle(cmd_text, {
+                "uid": uid, "name": name or author.get("username") or "群友",
+                "group_id": group_id, "user_openid": user_openid,
+                "is_owner": is_owner, "receiver": self,
+            })
+            if meta_out is not None:
+                reply = meta_out
+                print(f"[{self.bot_name}] 元命令命中: {content!r}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self.bot_name}] 元命令异常（放行）: {exc}", flush=True)
+        # ---- 入群审核系统（命令拦截型） ----
+        if reply is None:
+            try:
+                import qq_hr
+                cmd_text = content[1:].strip() if content.startswith("/") else content
+                hr_out = qq_hr.hr_handle(
+                    uid,
+                    name or author.get("username") or "群友",
+                    cmd_text, is_admin=is_admin, is_owner=is_owner)
+                if hr_out:
+                    reply = hr_out
+                    print(f"[{self.bot_name}] 入群系统接管: {content!r}", flush=True)
+            except Exception as exc:
+                print(f"[{self.bot_name}] 入群系统异常（放行大模型）: {exc}", flush=True)
         # ---- 自定义指令 ----
         # 排在内置命令之后：不许管理员改坏一条就把"入群/花名册"这些核心流程堵死。
         # 触发门槛：群聊要 @机器人 或 / 前缀，私聊要 / 前缀——裸关键词会让
@@ -420,30 +431,37 @@ class Receiver:
         except Exception as exc:
             print(f"[{self.bot_name}] 私聊通知发送异常: {exc}", flush=True)
         if not reply:
+            import qq_meta
+            sess = qq_meta.get_session(group_id, user_openid)
+            # strict 模式：只听指令，不闲聊
+            if sess.mode == "strict":
+                reply = "🤖 严格模式已开启，只响应指令。发送 /mode free 退出。"
+        if not reply:
             try:
                 from qq_brain import generate
+                import qq_meta, qq_personas
+                sess = qq_meta.get_session(group_id, user_openid)
+                sys_prompt = qq_personas.get(sess.agent)["system"]
+                if is_owner:
+                    sys_prompt = (f"对方是你的主人「{owner_label}」——你最该盯的人，"
+                                  f"也是你最服的人。态度可以软一点、黏一点，"
+                                  f"但毒舌本色别丢。\n") + sys_prompt
+                api_override = None
+                if sess.model:
+                    resolved = qq_meta.resolve_model(sess.model)
+                    if resolved:
+                        api_override = resolved
                 reply = generate(
-                f"对方说：{content}" + (f"（记住：对方叫 {name}，直接称呼其名）"
-                                       if name else "（你还不知道对方名字，不要编造，用'你'称呼即可）"),
-                system=(
-                    ((f"对方是你的主人「{owner_label}」——你最该盯的人，也是你最服的人。"
-                      f"态度可以软一点、黏一点，但毒舌本色别丢。")
-                     if is_owner else "")
-                    +
-                    (f"你是「{self.bot_name}」——群里同学的学习搭子，嘴毒但真希望他们好。"
-                     f"风格：毒舌但暖、有梗、带中二、爱call名字，不爹味。最多两句话。"
-                     f"只给消息正文，不要引号、不要'好的'之类废话。")
-                    if group_id else
-                    (((f"对方是你的主人「{owner_label}」——你最该盯的人，也是你最服的人。"
-                       f"态度可以软一点、黏一点，但毒舌本色别丢。")
-                      if is_owner else "")
-                     +
-                     (f"你是「{self.bot_name}」——专门监督好好学习的毒舌小助手，核心算法是'监督学习'（监督的是人的学习）。"
-                      f"风格：毒舌但暖、有梗、带中二、爱call对方名字、偶尔甩热词，绝不爹味说教，最多两句话。"
-                      f"用最短的话把人从摸鱼/躺平里拽起来。不涉及扣分与记账，只催学。只给消息正文，不要引号、不要'好的'之类废话。"))
-                ),
-                max_tokens=60, temperature=0.7,
-            )
+                    f"对方说：{content}" + (f"（记住：对方叫 {name}，直接称呼其名）"
+                                           if name else "（你还不知道对方名字，不要编造，用'你'称呼即可）"),
+                    system=sys_prompt,
+                    max_tokens=60, temperature=0.7,
+                    history=sess.history,
+                    api_override=api_override,
+                )
+                if reply:
+                    sess.push("user", content)
+                    sess.push("assistant", reply)
             except Exception as exc:
                 print(f"[{self.bot_name}] 大脑失败: {exc}", flush=True)
                 reply = "我在的，有什么事？"

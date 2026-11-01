@@ -46,6 +46,8 @@ OLLAMA_MODEL = os.environ.get("QQ_OLLAMA_MODEL", "llama3.2:3b")
 
 TORCH_THREADS = 8
 
+_BRAIN_HISTORY_LIMIT = 10  # 多轮记忆窗口（拼进 prompt 的历史条数上限）
+
 _LOCAL: dict[str, tuple] = {}  # 按目录缓存 (model, tokenizer)
 
 
@@ -203,7 +205,8 @@ def _gen_gguf(prompt: str, system: str = "", temperature: float = 0.85,
 
 
 def _gen_api(prompt: str, system: str, temperature: float,
-             max_tokens: int) -> str:
+             max_tokens: int, base: str | None = None,
+             key: str | None = None, model: str | None = None) -> str:
     """OpenAI 兼容 HTTP API 后端（DeepSeek / GLM / 硅基流动 / GitHub Models 等）。
 
     由 .env 三件套配置：
@@ -211,10 +214,11 @@ def _gen_api(prompt: str, system: str, temperature: float,
       QQ_BRAIN_API_KEY   sk-xxx
       QQ_BRAIN_API_MODEL 如 deepseek-chat / glm-4-flash（免费档）
     延迟 import 无依赖；服务器上不装 torch/transformers 也能跑。
+    也可由调用方传入 base/key/model 覆盖环境变量（会话级模型切换用）。
     """
-    base = os.environ.get("QQ_BRAIN_API_BASE", "").rstrip("/")
-    key = os.environ.get("QQ_BRAIN_API_KEY", "")
-    model = os.environ.get("QQ_BRAIN_API_MODEL", "")
+    base = (base or os.environ.get("QQ_BRAIN_API_BASE", "")).rstrip("/")
+    key = key or os.environ.get("QQ_BRAIN_API_KEY", "")
+    model = model or os.environ.get("QQ_BRAIN_API_MODEL", "")
     if not (base and key and model):
         raise RuntimeError("API 后端未配置（QQ_BRAIN_API_BASE/KEY/MODEL 三缺一）")
     import json
@@ -241,8 +245,29 @@ def _gen_api(prompt: str, system: str, temperature: float,
 
 
 def generate(prompt: str, system: str = "", temperature: float = 0.85,
-             max_tokens: int = 220) -> str:
-    """生成回复，失败依次降级；全部失败抛 RuntimeError。"""
+             max_tokens: int = 220, history: list | None = None,
+             api_override: tuple | None = None) -> str:
+    """生成回复，失败依次降级；全部失败抛 RuntimeError。
+
+    history       最近对话列表 [{role, content}]，拼成「历史对话」上下文（多轮记忆）。
+    api_override  会话级模型覆盖：(base, key, model_name) 三元组；指定时优先走
+                 API 后端，而非由 QQ_BRAIN_MODEL 决定的全局后端。
+    """
+    # 多轮上下文：拼成「历史对话」文本，对所有后端通用（本地模型也是单 prompt）
+    if history:
+        ctx_lines = []
+        for m in history[-_BRAIN_HISTORY_LIMIT:]:
+            who = "用户" if m.get("role") == "user" else "助手"
+            ctx_lines.append(f"{who}：{m.get('content', '')}")
+        prompt = "【历史对话】\n" + "\n".join(ctx_lines) + "\n\n【当前消息】\n" + prompt
+    # 会话级模型：指定时优先走 API 后端用给定三元组
+    if api_override:
+        base, key, model = api_override
+        try:
+            return _gen_api(prompt, system, temperature, max_tokens,
+                            base=base, key=key, model=model)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"api[{model}]: {exc}")
     errs = []
 
     # 模型优先级选择（环境变量 QQ_BRAIN_MODEL）：
