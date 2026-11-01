@@ -37,4 +37,6 @@ qq_time_cache.json
 # ===== 关注名单（含群成员 QQ 号 + 昵称 + openid，属隐私数据）=====
 qq_watchlist.json
 qq_staff.json
+# 自定义指令（含创建者 openid + 昵称，属隐私数据）
+qq_cmds.json
 qq_admins.json

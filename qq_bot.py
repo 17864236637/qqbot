@@ -90,6 +90,13 @@ class QQBot:
         )
         return data or {}
 
+    def _delete(self, path: str) -> dict:
+        token = self.get_access_token()
+        status, data = _retry_request(
+            "DELETE", path, None, {"Authorization": f"QQBot {token}"},
+        )
+        return data or {}
+
     def send_group_message(self, group_openid: str, content: str,
                            msg_type: int = 0) -> dict:
         """发送群消息。
@@ -107,3 +114,25 @@ class QQBot:
 
     def send_markdown(self, group_openid: str, markdown: str) -> dict:
         return self.send_group_message(group_openid, markdown, msg_type=2)
+
+    # ---------- 撤回（群聊 + 私聊，实测均可用） ----------
+    # 坑：必须传真实 message id，且群号不能为空——GROUP_OPENID 缺失时路径会变成
+    # /v2/groups//messages/...，服务端回 11001「不支持的调用」，长得跟接口不存在一样，
+    # 极易误判成"平台没开放撤回"。撤回失败只抛异常，由调用方决定要不要降级。
+    def recall_group_message(self, group_openid: str, message_id: str,
+                             hidetip: bool = True) -> bool:
+        """撤回群消息。hidetip=True 不留下"xx撤回了一条消息"的小灰条。"""
+        if not (group_openid and message_id):
+            return False
+        self._delete(f"/v2/groups/{group_openid}/messages/{message_id}"
+                     f"?hidetip={'true' if hidetip else 'false'}")
+        return True
+
+    def recall_c2c_message(self, openid: str, message_id: str,
+                           hidetip: bool = True) -> bool:
+        """撤回单聊（私聊）消息。"""
+        if not (openid and message_id):
+            return False
+        self._delete(f"/v2/users/{openid}/messages/{message_id}"
+                     f"?hidetip={'true' if hidetip else 'false'}")
+        return True

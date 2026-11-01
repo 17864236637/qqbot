@@ -240,12 +240,14 @@ class Receiver:
         """发送并针对『IP 不在白名单』重试。
 
         沙箱出口 IP 每次请求可能不同，重试可显著提高送达率（与监管端同理）。
+        成功返回 (True, 响应 dict)——响应里的 id 是撤回凭证，必须留着；
+        失败返回 (False, 异常)。
         """
         last = None
         for i in range(tries):
             try:
-                self.bot._post(path, payload)
-                return True, None
+                res = self.bot._post(path, payload)
+                return True, res
             except QQBotError as exc:
                 last = exc
                 if "白名单" not in str(exc):
@@ -253,6 +255,44 @@ class Receiver:
                 if i < tries - 1:
                     time.sleep(2)
         return False, last
+
+    def _manage_cmd(self, act: tuple, uid: str, is_admin: bool, is_owner: bool,
+                    name: str) -> tuple[str | None, int]:
+        """处理指令的增删改查。返回 (回复文案, 撤回延迟)。
+
+        权限按用户定的分层：管理员可增，删除收归主人。
+        """
+        import qq_cmds
+        action, args = act
+        if action == "list":
+            return qq_cmds.list_text(), 0
+        if action == "add":
+            if not (is_admin or is_owner):
+                return "添加指令是管理员权限哦～", 0
+            ok, errmsg, opts = qq_cmds.parse_add_opts(args["keyword"], args["rest"])
+            if not ok:
+                return errmsg, 0
+            _, out = qq_cmds.add(by=uid, by_name=name, **opts)
+            return out, 0
+        if action == "del":
+            if not is_owner:
+                return "删除指令是主人的专属权限，管理员删不了～", 0
+            _, out = qq_cmds.remove(args["keyword"])
+            return out, 0
+        return None, 0
+
+    def _maybe_recall(self, kind: str, target: str, res: object, delay: int) -> None:
+        """发送后按需排一个延迟撤回。撤回失败无所谓，最坏结果是消息留着。"""
+        if not delay or not isinstance(res, dict) or not target:
+            return
+        mid = res.get("id")
+        if not mid:
+            return
+        try:
+            import qq_cleanup
+            qq_cleanup.recall_later(self.bot, kind, target, mid, delay)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _reply(self, msg: dict) -> None:
         mid = msg.get("id")
@@ -285,6 +325,7 @@ class Receiver:
         # ---- 入群审核系统（命令拦截型：命中即接管，不调大模型，毫秒级） ----
         # 岗位申请/问卷作答/管理命令全在这里闭环；未命中返回 None，放行大模型。
         reply = None
+        auto_recall = 0     # 本条回复的自动撤回延迟（秒），指令配了 autodel 才非 0
         try:
             import qq_hr
             # 管理员身份：群消息认 member_role（owner 也算——QQ 对群主下发的是
@@ -311,16 +352,62 @@ class Receiver:
             except Exception as exc:  # noqa: BLE001
                 print(f"[{self.bot_name}] 主人模块异常（按非主人处理）: {exc}",
                       flush=True)
+            # "/" 前缀是自定义指令的门槛，但对内置命令必须透明——否则 "/入群"
+            # 进不了内置流程，会一路漏到自定义指令甚至大脑，连权限都能绕过去。
+            cmd_text = content[1:].strip() if content.startswith("/") else content
             hr_out = qq_hr.hr_handle(
                 uid,
                 name or author.get("username") or "群友",
-                content, is_admin=is_admin, is_owner=is_owner)
+                cmd_text, is_admin=is_admin, is_owner=is_owner)
             if hr_out:
                 reply = hr_out
                 print(f"[{self.bot_name}] 入群系统接管: {content!r}", flush=True)
         except Exception as exc:
             # 入群系统炸了不能拖死聊天：放行大模型，日志留痕
             print(f"[{self.bot_name}] 入群系统异常（放行大模型）: {exc}", flush=True)
+        # ---- 自定义指令 ----
+        # 排在内置命令之后：不许管理员改坏一条就把"入群/花名册"这些核心流程堵死。
+        # 触发门槛：群聊要 @机器人 或 / 前缀，私聊要 / 前缀——裸关键词会让
+        # 机器人变成话痨，别人聊到"打卡"俩字就被插嘴。
+        if reply is None:
+            try:
+                mentioned = bool(re.search(r"<@!?[A-Za-z0-9_]+>", raw))
+                has_prefix = content.startswith("/")
+                armed = has_prefix or (group_id and mentioned)
+                if armed:
+                    body = content.lstrip("/").strip() if has_prefix \
+                        else content.strip()
+                    import qq_cmds
+                    act = qq_cmds.parse_manage(body)
+                    if act:
+                        reply, auto_recall = self._manage_cmd(
+                            act, uid, is_admin, is_owner,
+                            name or author.get("username") or "")
+                    else:
+                        m = qq_cmds.match(body)
+                        if m:
+                            key, cmd = m
+                            if cmd.get("scope") == "admin" \
+                                    and not (is_admin or is_owner):
+                                reply = "这条指令只有管理员能用。"
+                            else:
+                                reply = cmd.get("reply") or ""
+                                auto_recall = int(cmd.get("autodel") or 0)
+                                qq_cmds.hit(key)
+                                print(f"[{self.bot_name}] 自定义指令命中: {key}"
+                                      f"{f'（{auto_recall}s 后撤回）' if auto_recall else ''}",
+                                      flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[{self.bot_name}] 自定义指令异常（放行大模型）: {exc}",
+                      flush=True)
+        # 惰性清理：有消息进来顺手做，内部各自限频，不会每条消息都扫文件
+        try:
+            import qq_cmds, qq_cleanup
+            qq_cmds.sweep()                 # 过期指令
+            qq_cleanup.sweep_sessions()     # 卡住的问卷/点单
+            qq_cleanup.daily_prune()        # 日志与归档（6 小时一次）
+        except Exception as exc:  # noqa: BLE001
+            print(f"[{self.bot_name}] 清理异常（忽略）: {exc}", flush=True)
         # 入群系统排队中的私聊通知（点单/接单/完结）在这里发给对应的人
         try:
             import qq_hr
@@ -366,19 +453,25 @@ class Receiver:
             payload = {"msg_type": 2, "markdown": {"content": reply}}
             if msg_id:
                 payload["msg_id"] = msg_id  # 被动回复，绕开主动消息限制
-            ok, err = self._post_retry(f"/v2/groups/{group_id}/messages", payload)
+            res2 = self._post_retry(f"/v2/groups/{group_id}/messages", payload)
+            ok, err = res2
             print(f"[{self.bot_name}] {'已回群' if ok else '群回复失败'} "
                   f"{group_id}{'' if ok else ': ' + str(err)[:80]}", flush=True)
             print(f"[{self.bot_name}] 回复内容: {reply!r}", flush=True)
+            if ok:
+                self._maybe_recall("group", group_id, res2[1], auto_recall)
             log_chat("group", group_id, user_openid or "", content, reply, ok)
         elif user_openid:
             payload = {"msg_type": 2, "markdown": {"content": reply}}
             if msg_id:
                 payload["msg_id"] = msg_id
-            ok, err = self._post_retry(f"/v2/users/{user_openid}/messages", payload)
+            res2 = self._post_retry(f"/v2/users/{user_openid}/messages", payload)
+            ok, err = res2
             print(f"[{self.bot_name}] {'已回私聊' if ok else '私聊回复失败'} "
                   f"{user_openid}{'' if ok else ': ' + str(err)[:80]}", flush=True)
             print(f"[{self.bot_name}] 回复内容: {reply!r}", flush=True)
+            if ok:
+                self._maybe_recall("c2c", user_openid, res2[1], auto_recall)
             log_chat("private", user_openid, user_openid, content, reply, ok)
         else:
             # 教训：曾经这里两不管——回复生成了却静默丢弃，日志无任何痕迹，
